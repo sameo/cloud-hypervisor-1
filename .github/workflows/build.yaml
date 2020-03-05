@@ -1,0 +1,18 @@
+name: Cloud Hypervisor Actions
+on: [push]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v2
+      - name: Install Rust toolchain (stable)
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: stable
+            override: true
+
+      - name: Build
+        run: cargo build --release

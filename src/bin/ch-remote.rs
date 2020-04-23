@@ -23,6 +23,11 @@ enum Error {
     InvalidCPUCount(std::num::ParseIntError),
     InvalidMemorySize(std::num::ParseIntError),
     AddDeviceConfig(vmm::config::Error),
+    AddDiskConfig(vmm::config::Error),
+    AddFsConfig(vmm::config::Error),
+    AddPmemConfig(vmm::config::Error),
+    AddNetConfig(vmm::config::Error),
+    Restore(vmm::config::Error),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +218,74 @@ fn remove_device_api_command(socket: &mut UnixStream, id: &str) -> Result<(), Er
     )
 }
 
+fn add_disk_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
+    let disk_config = vmm::config::DiskConfig::parse(config).map_err(Error::AddDiskConfig)?;
+
+    simple_api_command(
+        socket,
+        "PUT",
+        "add-disk",
+        Some(&serde_json::to_string(&disk_config).unwrap()),
+    )
+}
+
+fn add_fs_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
+    let fs_config = vmm::config::FsConfig::parse(config).map_err(Error::AddFsConfig)?;
+
+    simple_api_command(
+        socket,
+        "PUT",
+        "add-fs",
+        Some(&serde_json::to_string(&fs_config).unwrap()),
+    )
+}
+
+fn add_pmem_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
+    let pmem_config = vmm::config::PmemConfig::parse(config).map_err(Error::AddPmemConfig)?;
+
+    simple_api_command(
+        socket,
+        "PUT",
+        "add-pmem",
+        Some(&serde_json::to_string(&pmem_config).unwrap()),
+    )
+}
+
+fn add_net_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
+    let net_config = vmm::config::NetConfig::parse(config).map_err(Error::AddNetConfig)?;
+
+    simple_api_command(
+        socket,
+        "PUT",
+        "add-net",
+        Some(&serde_json::to_string(&net_config).unwrap()),
+    )
+}
+
+fn snapshot_api_command(socket: &mut UnixStream, url: &str) -> Result<(), Error> {
+    let snapshot_config = vmm::api::VmSnapshotConfig {
+        destination_url: String::from(url),
+    };
+
+    simple_api_command(
+        socket,
+        "PUT",
+        "snapshot",
+        Some(&serde_json::to_string(&snapshot_config).unwrap()),
+    )
+}
+
+fn restore_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
+    let restore_config = vmm::config::RestoreConfig::parse(config).map_err(Error::Restore)?;
+
+    simple_api_command(
+        socket,
+        "PUT",
+        "restore",
+        Some(&serde_json::to_string(&restore_config).unwrap()),
+    )
+}
+
 fn do_command(matches: &ArgMatches) -> Result<(), Error> {
     let mut socket =
         UnixStream::connect(matches.value_of("api-socket").unwrap()).map_err(Error::Socket)?;
@@ -246,6 +319,54 @@ fn do_command(matches: &ArgMatches) -> Result<(), Error> {
                 .value_of("id")
                 .unwrap(),
         ),
+        Some("add-disk") => add_disk_api_command(
+            &mut socket,
+            matches
+                .subcommand_matches("add-disk")
+                .unwrap()
+                .value_of("disk_config")
+                .unwrap(),
+        ),
+        Some("add-fs") => add_fs_api_command(
+            &mut socket,
+            matches
+                .subcommand_matches("add-fs")
+                .unwrap()
+                .value_of("fs_config")
+                .unwrap(),
+        ),
+        Some("add-pmem") => add_pmem_api_command(
+            &mut socket,
+            matches
+                .subcommand_matches("add-pmem")
+                .unwrap()
+                .value_of("pmem_config")
+                .unwrap(),
+        ),
+        Some("add-net") => add_net_api_command(
+            &mut socket,
+            matches
+                .subcommand_matches("add-net")
+                .unwrap()
+                .value_of("net_config")
+                .unwrap(),
+        ),
+        Some("snapshot") => snapshot_api_command(
+            &mut socket,
+            matches
+                .subcommand_matches("snapshot")
+                .unwrap()
+                .value_of("snapshot_config")
+                .unwrap(),
+        ),
+        Some("restore") => restore_api_command(
+            &mut socket,
+            matches
+                .subcommand_matches("restore")
+                .unwrap()
+                .value_of("restore_config")
+                .unwrap(),
+        ),
         Some(c) => simple_api_command(&mut socket, "PUT", c, None),
         None => unreachable!(),
     }
@@ -267,10 +388,47 @@ fn main() {
         .subcommand(
             SubCommand::with_name("add-device")
                 .about("Add VFIO device")
-                .arg(Arg::with_name("device_config").index(1).help(
-                    "Direct device assignment parameters \
-                     \"path=<device_path>,iommu=on|off,id=<device_id>\"",
-                )),
+                .arg(
+                    Arg::with_name("device_config")
+                        .index(1)
+                        .help(vmm::config::DeviceConfig::SYNTAX),
+                ),
+        )
+        .subcommand(
+            SubCommand::with_name("add-disk")
+                .about("Add block device")
+                .arg(
+                    Arg::with_name("disk_config")
+                        .index(1)
+                        .help(vmm::config::DiskConfig::SYNTAX),
+                ),
+        )
+        .subcommand(
+            SubCommand::with_name("add-fs")
+                .about("Add virtio-fs backed fs device")
+                .arg(
+                    Arg::with_name("fs_config")
+                        .index(1)
+                        .help(vmm::config::FsConfig::SYNTAX),
+                ),
+        )
+        .subcommand(
+            SubCommand::with_name("add-pmem")
+                .about("Add persistent memory device")
+                .arg(
+                    Arg::with_name("pmem_config")
+                        .index(1)
+                        .help(vmm::config::PmemConfig::SYNTAX),
+                ),
+        )
+        .subcommand(
+            SubCommand::with_name("add-net")
+                .about("Add network device")
+                .arg(
+                    Arg::with_name("net_config")
+                        .index(1)
+                        .help(vmm::config::NetConfig::SYNTAX),
+                ),
         )
         .subcommand(
             SubCommand::with_name("remove-device")
@@ -299,7 +457,25 @@ fn main() {
                 ),
         )
         .subcommand(SubCommand::with_name("resume").about("Resume the VM"))
-        .subcommand(SubCommand::with_name("shutdown").about("Shutdown the VM"));
+        .subcommand(SubCommand::with_name("shutdown").about("Shutdown the VM"))
+        .subcommand(
+            SubCommand::with_name("snapshot")
+                .about("Create a snapshot from VM")
+                .arg(
+                    Arg::with_name("snapshot_config")
+                        .index(1)
+                        .help("<destination_url>"),
+                ),
+        )
+        .subcommand(
+            SubCommand::with_name("restore")
+                .about("Restore VM from a snapshot")
+                .arg(
+                    Arg::with_name("restore_config")
+                        .index(1)
+                        .help(vmm::config::RestoreConfig::SYNTAX),
+                ),
+        );
 
     let matches = app.get_matches();
 

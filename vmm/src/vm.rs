@@ -1,3 +1,5 @@
+// Copyright © 2020, Oracle and/or its affiliates.
+//
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
@@ -9,7 +11,6 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-extern crate anyhow;
 extern crate arch;
 extern crate devices;
 extern crate epoll;
@@ -24,39 +25,44 @@ extern crate vm_allocator;
 extern crate vm_memory;
 extern crate vm_virtio;
 
-use crate::config::{DeviceConfig, VmConfig};
+use crate::config::{
+    DeviceConfig, DiskConfig, FsConfig, HotplugMethod, NetConfig, PmemConfig, ValidationError,
+    VmConfig,
+};
 use crate::cpu;
 use crate::device_manager::{get_win_size, Console, DeviceManager, DeviceManagerError};
-use crate::memory_manager::{get_host_cpu_phys_bits, Error as MemoryManagerError, MemoryManager};
+use crate::memory_manager::{Error as MemoryManagerError, MemoryManager};
+use crate::migration::{url_to_path, vm_config_from_snapshot, VM_SNAPSHOT_FILE};
+use crate::{CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, MEMORY_MANAGER_SNAPSHOT_ID};
 use anyhow::anyhow;
-use arch::layout;
+use arch::{BootProtocol, EntryPoint};
 use devices::{ioapic, HotPlugNotificationFlags};
 use kvm_bindings::{kvm_enable_cap, kvm_userspace_memory_region, KVM_CAP_SPLIT_IRQCHIP};
 use kvm_ioctls::*;
 use linux_loader::cmdline::Cmdline;
+use linux_loader::loader::elf::Error::InvalidElfMagicNumber;
 use linux_loader::loader::KernelLoader;
 use signal_hook::{iterator::Signals, SIGINT, SIGTERM, SIGWINCH};
+use std::convert::TryInto;
 use std::ffi::CString;
-use std::fs::File;
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::io::{self, Seek, SeekFrom};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::{result, str, thread};
-use vm_allocator::{GsiApic, SystemAllocator};
-use vm_device::{Migratable, MigratableError, Pausable, Snapshotable};
+use url::Url;
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryMmap,
-    GuestMemoryRegion, GuestUsize,
+    GuestMemoryRegion,
+};
+use vm_migration::{
+    Migratable, MigratableError, Pausable, Snapshot, SnapshotDataSection, Snapshottable,
+    Transportable,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::terminal::Terminal;
-
-const X86_64_IRQ_BASE: u32 = 5;
-
-// CPUID feature bits
-const TSC_DEADLINE_TIMER_ECX_BIT: u8 = 24; // tsc deadline timer ecx bit.
-const HYPERVISOR_ECX_BIT: u8 = 31; // Hypervisor ecx bit.
 
 // 64 bit direct boot entry offset for bzImage
 const KERNEL_64BIT_ENTRY_OFFSET: u64 = 0x200;
@@ -76,8 +82,14 @@ pub enum Error {
     /// Cannot open the kernel image
     KernelFile(io::Error),
 
+    /// Cannot open the initramfs image
+    InitramfsFile(io::Error),
+
     /// Cannot load the kernel in memory
     KernelLoad(linux_loader::loader::Error),
+
+    /// Cannot load the initramfs in memory
+    InitramfsLoad,
 
     /// Cannot load the command line in memory
     LoadCmdLine(linux_loader::loader::Error),
@@ -105,9 +117,6 @@ pub enum Error {
     /// Cannot setup terminal in canonical mode.
     SetTerminalCanon(vmm_sys_util::errno::Error),
 
-    /// Cannot create the system allocator
-    CreateSystemAllocator,
-
     /// Failed parsing network parameters
     ParseNetworkParameters,
 
@@ -128,6 +137,9 @@ pub enum Error {
 
     /// VM is not created
     VmNotCreated,
+
+    /// VM is already created
+    VmAlreadyCreated,
 
     /// VM is not running
     VmNotRunning,
@@ -167,6 +179,24 @@ pub enum Error {
 
     /// No PCI support
     NoPciSupport,
+
+    /// Eventfd write error
+    EventfdError(std::io::Error),
+
+    /// Cannot snapshot VM
+    Snapshot(MigratableError),
+
+    /// Cannot restore VM
+    Restore(MigratableError),
+
+    /// Cannot send VM snapshot
+    SnapshotSend(MigratableError),
+
+    /// Cannot convert source URL from Path into &str
+    RestoreSourceUrlPathToStr,
+
+    /// Failed to validate config
+    ConfigValidation(ValidationError),
 }
 pub type Result<T> = result::Result<T, Error>;
 
@@ -214,6 +244,7 @@ impl VmState {
 
 pub struct Vm {
     kernel: File,
+    initramfs: Option<File>,
     threads: Vec<thread::JoinHandle<()>>,
     device_manager: Arc<Mutex<DeviceManager>>,
     config: Arc<Mutex<VmConfig>>,
@@ -225,12 +256,7 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(
-        config: Arc<Mutex<VmConfig>>,
-        exit_evt: EventFd,
-        reset_evt: EventFd,
-        vmm_path: PathBuf,
-    ) -> Result<Self> {
+    fn kvm_new() -> Result<(Kvm, Arc<VmFd>)> {
         let kvm = Kvm::new().map_err(Error::KvmNew)?;
 
         // Check required capabilities:
@@ -245,9 +271,6 @@ impl Vm {
         if !kvm.check_extension(Cap::SplitIrqchip) {
             return Err(Error::CapabilityMissing(Cap::SplitIrqchip));
         }
-
-        let kernel = File::open(&config.lock().unwrap().kernel.as_ref().unwrap().path)
-            .map_err(Error::KernelFile)?;
 
         let fd: VmFd;
         loop {
@@ -272,7 +295,6 @@ impl Vm {
         fd.set_tss_address(arch::x86_64::layout::KVM_TSS_ADDRESS.raw_value() as usize)
             .map_err(Error::VmSetup)?;
 
-        let mut cpuid_patches = Vec::new();
         // Create split irqchip
         // Only the local APIC is emulated in kernel, both PICs and IOAPIC
         // are not.
@@ -281,72 +303,27 @@ impl Vm {
         cap.args[0] = ioapic::NUM_IOAPIC_PINS as u64;
         fd.enable_cap(&cap).map_err(Error::VmSetup)?;
 
-        // Patch tsc deadline timer bit
-        cpuid_patches.push(cpu::CpuidPatch {
-            function: 1,
-            index: 0,
-            flags_bit: None,
-            eax_bit: None,
-            ebx_bit: None,
-            ecx_bit: Some(TSC_DEADLINE_TIMER_ECX_BIT),
-            edx_bit: None,
-        });
+        Ok((kvm, fd))
+    }
 
-        // Patch hypervisor bit
-        cpuid_patches.push(cpu::CpuidPatch {
-            function: 1,
-            index: 0,
-            flags_bit: None,
-            eax_bit: None,
-            ebx_bit: None,
-            ecx_bit: Some(HYPERVISOR_ECX_BIT),
-            edx_bit: None,
-        });
-
-        // Supported CPUID
-        let mut cpuid = kvm
-            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-            .map_err(Error::VmSetup)?;
-
-        cpu::CpuidPatch::patch_cpuid(&mut cpuid, cpuid_patches);
-
-        let ioapic = GsiApic::new(
-            X86_64_IRQ_BASE,
-            ioapic::NUM_IOAPIC_PINS as u32 - X86_64_IRQ_BASE,
-        );
-
-        // Let's allocate 64 GiB of addressable MMIO space, starting at 0.
-        let allocator = Arc::new(Mutex::new(
-            SystemAllocator::new(
-                GuestAddress(0),
-                1 << 16 as GuestUsize,
-                GuestAddress(0),
-                1 << get_host_cpu_phys_bits(),
-                layout::MEM_32BIT_RESERVED_START,
-                layout::MEM_32BIT_DEVICES_SIZE,
-                vec![ioapic],
-            )
-            .ok_or(Error::CreateSystemAllocator)?,
-        ));
-
-        let memory_config = config.lock().unwrap().memory.clone();
-
-        let memory_manager = MemoryManager::new(
-            allocator.clone(),
-            fd.clone(),
-            memory_config.size,
-            memory_config.hotplug_size,
-            &memory_config.file,
-            memory_config.mergeable,
-        )
-        .map_err(Error::MemoryManager)?;
-
-        let guest_memory = memory_manager.lock().unwrap().guest_memory();
+    fn new_from_memory_manager(
+        config: Arc<Mutex<VmConfig>>,
+        memory_manager: Arc<Mutex<MemoryManager>>,
+        fd: Arc<VmFd>,
+        kvm: Kvm,
+        exit_evt: EventFd,
+        reset_evt: EventFd,
+        vmm_path: PathBuf,
+    ) -> Result<Self> {
+        config
+            .lock()
+            .unwrap()
+            .validate()
+            .map_err(Error::ConfigValidation)?;
 
         let device_manager = DeviceManager::new(
             fd.clone(),
             config.clone(),
-            allocator,
             memory_manager.clone(),
             &exit_evt,
             &reset_evt,
@@ -354,23 +331,32 @@ impl Vm {
         )
         .map_err(Error::DeviceManager)?;
 
-        let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO as i32) } != 0;
-
-        let boot_vcpus = config.lock().unwrap().cpus.boot_vcpus;
-        let max_vcpus = config.lock().unwrap().cpus.max_vcpus;
         let cpu_manager = cpu::CpuManager::new(
-            boot_vcpus,
-            max_vcpus,
+            &config.lock().unwrap().cpus.clone(),
             &device_manager,
-            guest_memory,
+            memory_manager.lock().unwrap().guest_memory(),
+            &kvm,
             fd,
-            cpuid,
             reset_evt,
         )
         .map_err(Error::CpuManager)?;
 
+        let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO as i32) } != 0;
+        let kernel = File::open(&config.lock().unwrap().kernel.as_ref().unwrap().path)
+            .map_err(Error::KernelFile)?;
+
+        let initramfs = config
+            .lock()
+            .unwrap()
+            .initramfs
+            .as_ref()
+            .map(|i| File::open(&i.path))
+            .transpose()
+            .map_err(Error::InitramfsFile)?;
+
         Ok(Vm {
             kernel,
+            initramfs,
             device_manager,
             config,
             on_tty,
@@ -382,7 +368,94 @@ impl Vm {
         })
     }
 
-    fn load_kernel(&mut self) -> Result<GuestAddress> {
+    pub fn new(
+        config: Arc<Mutex<VmConfig>>,
+        exit_evt: EventFd,
+        reset_evt: EventFd,
+        vmm_path: PathBuf,
+    ) -> Result<Self> {
+        let (kvm, fd) = Vm::kvm_new()?;
+        let memory_manager = MemoryManager::new(
+            fd.clone(),
+            &config.lock().unwrap().memory.clone(),
+            None,
+            false,
+        )
+        .map_err(Error::MemoryManager)?;
+
+        Vm::new_from_memory_manager(
+            config,
+            memory_manager,
+            fd,
+            kvm,
+            exit_evt,
+            reset_evt,
+            vmm_path,
+        )
+    }
+
+    pub fn new_from_snapshot(
+        snapshot: &Snapshot,
+        exit_evt: EventFd,
+        reset_evt: EventFd,
+        vmm_path: PathBuf,
+        source_url: &str,
+        prefault: bool,
+    ) -> Result<Self> {
+        let (kvm, fd) = Vm::kvm_new()?;
+        let config = vm_config_from_snapshot(snapshot).map_err(Error::Restore)?;
+
+        let memory_manager = if let Some(memory_manager_snapshot) =
+            snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID)
+        {
+            MemoryManager::new_from_snapshot(
+                memory_manager_snapshot,
+                fd.clone(),
+                &config.lock().unwrap().memory.clone(),
+                source_url,
+                prefault,
+            )
+            .map_err(Error::MemoryManager)?
+        } else {
+            return Err(Error::Restore(MigratableError::Restore(anyhow!(
+                "Missing memory manager snapshot"
+            ))));
+        };
+
+        Vm::new_from_memory_manager(
+            config,
+            memory_manager,
+            fd,
+            kvm,
+            exit_evt,
+            reset_evt,
+            vmm_path,
+        )
+    }
+
+    fn load_initramfs(&mut self, guest_mem: &GuestMemoryMmap) -> Result<arch::InitramfsConfig> {
+        let mut initramfs = self.initramfs.as_ref().unwrap();
+        let size: usize = initramfs
+            .seek(SeekFrom::End(0))
+            .map_err(|_| Error::InitramfsLoad)?
+            .try_into()
+            .unwrap();
+        initramfs
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| Error::InitramfsLoad)?;
+
+        let address =
+            arch::initramfs_load_addr(guest_mem, size).map_err(|_| Error::InitramfsLoad)?;
+        let address = GuestAddress(address);
+
+        guest_mem
+            .read_from(address, &mut initramfs, size)
+            .map_err(|_| Error::InitramfsLoad)?;
+
+        Ok(arch::InitramfsConfig { address, size })
+    }
+
+    fn load_kernel(&mut self) -> Result<EntryPoint> {
         let mut cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
         cmdline
             .insert_str(self.config.lock().unwrap().cmdline.args.clone())
@@ -394,15 +467,15 @@ impl Vm {
         let cmdline_cstring = CString::new(cmdline).map_err(Error::CmdLineCString)?;
         let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
         let mem = guest_memory.memory();
-        let entry_addr = match linux_loader::loader::Elf::load(
+        let entry_addr = match linux_loader::loader::elf::Elf::load(
             mem.deref(),
             None,
             &mut self.kernel,
             Some(arch::layout::HIGH_RAM_START),
         ) {
             Ok(entry_addr) => entry_addr,
-            Err(linux_loader::loader::Error::InvalidElfMagicNumber) => {
-                linux_loader::loader::BzImage::load(
+            Err(linux_loader::loader::Error::Elf(InvalidElfMagicNumber)) => {
+                linux_loader::loader::bzimage::BzImage::load(
                     mem.deref(),
                     None,
                     &mut self.kernel,
@@ -410,7 +483,9 @@ impl Vm {
                 )
                 .map_err(Error::KernelLoad)?
             }
-            _ => panic!("Invalid elf file"),
+            Err(e) => {
+                return Err(Error::KernelLoad(e));
+            }
         };
 
         linux_loader::loader::load_cmdline(
@@ -419,6 +494,12 @@ impl Vm {
             &cmdline_cstring,
         )
         .map_err(Error::LoadCmdLine)?;
+
+        let initramfs_config = match self.initramfs {
+            Some(_) => Some(self.load_initramfs(mem.deref())?),
+            None => None,
+        };
+
         let boot_vcpus = self.cpu_manager.lock().unwrap().boot_vcpus();
         let _max_vcpus = self.cpu_manager.lock().unwrap().max_vcpus();
 
@@ -441,9 +522,11 @@ impl Vm {
                     &mem,
                     arch::layout::CMDLINE_START,
                     cmdline_cstring.to_bytes().len() + 1,
+                    &initramfs_config,
                     boot_vcpus,
                     Some(hdr),
                     rsdp_addr,
+                    BootProtocol::LinuxBoot,
                 )
                 .map_err(Error::ConfigureSystem)?;
 
@@ -453,20 +536,41 @@ impl Vm {
                     .checked_add(KERNEL_64BIT_ENTRY_OFFSET)
                     .ok_or(Error::MemOverflow)?;
 
-                Ok(GuestAddress(load_addr))
+                Ok(EntryPoint {
+                    entry_addr: GuestAddress(load_addr),
+                    protocol: BootProtocol::LinuxBoot,
+                })
             }
             None => {
+                let entry_point_addr: GuestAddress;
+                let boot_prot: BootProtocol;
+
+                if let Some(pvh_entry_addr) = entry_addr.pvh_entry_addr {
+                    // Use the PVH kernel entry point to boot the guest
+                    entry_point_addr = pvh_entry_addr;
+                    boot_prot = BootProtocol::PvhBoot;
+                } else {
+                    // Use the Linux 64-bit boot protocol
+                    entry_point_addr = entry_addr.kernel_load;
+                    boot_prot = BootProtocol::LinuxBoot;
+                }
+
                 arch::configure_system(
                     &mem,
                     arch::layout::CMDLINE_START,
                     cmdline_cstring.to_bytes().len() + 1,
+                    &initramfs_config,
                     boot_vcpus,
                     None,
                     rsdp_addr,
+                    boot_prot,
                 )
                 .map_err(Error::ConfigureSystem)?;
 
-                Ok(entry_addr.kernel_load)
+                Ok(EntryPoint {
+                    entry_addr: entry_point_addr,
+                    protocol: boot_prot,
+                })
             }
         }
     }
@@ -525,19 +629,36 @@ impl Vm {
         }
 
         if let Some(desired_memory) = desired_memory {
-            if self
+            let new_region = self
                 .memory_manager
                 .lock()
                 .unwrap()
                 .resize(desired_memory)
-                .map_err(Error::MemoryManager)?
-            {
+                .map_err(Error::MemoryManager)?;
+
+            if let Some(new_region) = &new_region {
                 self.device_manager
                     .lock()
                     .unwrap()
-                    .notify_hotplug(HotPlugNotificationFlags::MEMORY_DEVICES_CHANGED)
+                    .update_memory(&new_region)
                     .map_err(Error::DeviceManager)?;
+
+                let memory_config = &self.config.lock().unwrap().memory;
+                match memory_config.hotplug_method {
+                    HotplugMethod::Acpi => {
+                        self.device_manager
+                            .lock()
+                            .unwrap()
+                            .notify_hotplug(HotPlugNotificationFlags::MEMORY_DEVICES_CHANGED)
+                            .map_err(Error::DeviceManager)?;
+                    }
+                    HotplugMethod::VirtioMem => {}
+                }
             }
+
+            // We update the VM config regardless of the actual guest resize
+            // operation result (happened or not), so that if the VM reboots
+            // it will be running with the last configure memory size.
             self.config.lock().unwrap().memory.size = desired_memory;
         }
         Ok(())
@@ -590,14 +711,157 @@ impl Vm {
                 // ensure the device would not be created in case of a reboot.
                 {
                     let mut config = self.config.lock().unwrap();
+
+                    // Remove if VFIO device
                     if let Some(devices) = config.devices.as_mut() {
-                        devices.retain(|dev| {
-                            if let Some(dev_id) = &dev.id {
-                                *dev_id != _id
-                            } else {
-                                true
-                            }
-                        });
+                        devices.retain(|dev| dev.id.as_ref() != Some(&_id));
+                    }
+
+                    // Remove if disk device
+                    if let Some(disks) = config.disks.as_mut() {
+                        disks.retain(|dev| dev.id.as_ref() != Some(&_id));
+                    }
+
+                    // Remove if net device
+                    if let Some(net) = config.net.as_mut() {
+                        net.retain(|dev| dev.id.as_ref() != Some(&_id));
+                    }
+
+                    // Remove if pmem device
+                    if let Some(pmem) = config.pmem.as_mut() {
+                        pmem.retain(|dev| dev.id.as_ref() != Some(&_id));
+                    }
+                }
+
+                self.device_manager
+                    .lock()
+                    .unwrap()
+                    .notify_hotplug(HotPlugNotificationFlags::PCI_DEVICES_CHANGED)
+                    .map_err(Error::DeviceManager)?;
+            }
+            Ok(())
+        } else {
+            Err(Error::NoPciSupport)
+        }
+    }
+
+    pub fn add_disk(&mut self, mut _disk_cfg: DiskConfig) -> Result<()> {
+        if cfg!(feature = "pci_support") {
+            #[cfg(feature = "pci_support")]
+            {
+                self.device_manager
+                    .lock()
+                    .unwrap()
+                    .add_disk(&mut _disk_cfg)
+                    .map_err(Error::DeviceManager)?;
+
+                // Update VmConfig by adding the new device. This is important to
+                // ensure the device would be created in case of a reboot.
+                {
+                    let mut config = self.config.lock().unwrap();
+                    if let Some(disks) = config.disks.as_mut() {
+                        disks.push(_disk_cfg);
+                    } else {
+                        config.disks = Some(vec![_disk_cfg]);
+                    }
+                }
+
+                self.device_manager
+                    .lock()
+                    .unwrap()
+                    .notify_hotplug(HotPlugNotificationFlags::PCI_DEVICES_CHANGED)
+                    .map_err(Error::DeviceManager)?;
+            }
+            Ok(())
+        } else {
+            Err(Error::NoPciSupport)
+        }
+    }
+
+    pub fn add_fs(&mut self, mut _fs_cfg: FsConfig) -> Result<()> {
+        if cfg!(feature = "pci_support") {
+            #[cfg(feature = "pci_support")]
+            {
+                self.device_manager
+                    .lock()
+                    .unwrap()
+                    .add_fs(&mut _fs_cfg)
+                    .map_err(Error::DeviceManager)?;
+
+                // Update VmConfig by adding the new device. This is important to
+                // ensure the device would be created in case of a reboot.
+                {
+                    let mut config = self.config.lock().unwrap();
+                    if let Some(fs_config) = config.fs.as_mut() {
+                        fs_config.push(_fs_cfg);
+                    } else {
+                        config.fs = Some(vec![_fs_cfg]);
+                    }
+                }
+
+                self.device_manager
+                    .lock()
+                    .unwrap()
+                    .notify_hotplug(HotPlugNotificationFlags::PCI_DEVICES_CHANGED)
+                    .map_err(Error::DeviceManager)?;
+            }
+            Ok(())
+        } else {
+            Err(Error::NoPciSupport)
+        }
+    }
+
+    pub fn add_pmem(&mut self, mut _pmem_cfg: PmemConfig) -> Result<()> {
+        if cfg!(feature = "pci_support") {
+            #[cfg(feature = "pci_support")]
+            {
+                self.device_manager
+                    .lock()
+                    .unwrap()
+                    .add_pmem(&mut _pmem_cfg)
+                    .map_err(Error::DeviceManager)?;
+
+                // Update VmConfig by adding the new device. This is important to
+                // ensure the device would be created in case of a reboot.
+                {
+                    let mut config = self.config.lock().unwrap();
+                    if let Some(pmem) = config.pmem.as_mut() {
+                        pmem.push(_pmem_cfg);
+                    } else {
+                        config.pmem = Some(vec![_pmem_cfg]);
+                    }
+                }
+
+                self.device_manager
+                    .lock()
+                    .unwrap()
+                    .notify_hotplug(HotPlugNotificationFlags::PCI_DEVICES_CHANGED)
+                    .map_err(Error::DeviceManager)?;
+            }
+            Ok(())
+        } else {
+            Err(Error::NoPciSupport)
+        }
+    }
+
+    pub fn add_net(&mut self, mut _net_cfg: NetConfig) -> Result<()> {
+        if cfg!(feature = "pci_support") {
+            #[cfg(feature = "pci_support")]
+            {
+                self.device_manager
+                    .lock()
+                    .unwrap()
+                    .add_net(&mut _net_cfg)
+                    .map_err(Error::DeviceManager)?;
+
+                // Update VmConfig by adding the new device. This is important to
+                // ensure the device would be created in case of a reboot.
+                {
+                    let mut config = self.config.lock().unwrap();
+                    if let Some(net) = config.net.as_mut() {
+                        net.push(_net_cfg);
+                    } else {
+                        config.net = Some(vec![_net_cfg]);
                     }
                 }
 
@@ -769,7 +1033,187 @@ impl Pausable for Vm {
     }
 }
 
-impl Snapshotable for Vm {}
+#[derive(Serialize, Deserialize)]
+pub struct VmSnapshot {
+    pub config: Arc<Mutex<VmConfig>>,
+}
+
+pub const VM_SNAPSHOT_ID: &str = "vm";
+impl Snapshottable for Vm {
+    fn id(&self) -> String {
+        VM_SNAPSHOT_ID.to_string()
+    }
+
+    fn snapshot(&self) -> std::result::Result<Snapshot, MigratableError> {
+        let current_state = self.get_state().unwrap();
+        if current_state != VmState::Paused {
+            return Err(MigratableError::Snapshot(anyhow!(
+                "Trying to snapshot while VM is running"
+            )));
+        }
+
+        let mut vm_snapshot = Snapshot::new(VM_SNAPSHOT_ID);
+        let vm_snapshot_data = serde_json::to_vec(&VmSnapshot {
+            config: self.get_config(),
+        })
+        .map_err(|e| MigratableError::Snapshot(e.into()))?;
+
+        vm_snapshot.add_snapshot(self.cpu_manager.lock().unwrap().snapshot()?);
+        vm_snapshot.add_snapshot(self.memory_manager.lock().unwrap().snapshot()?);
+        vm_snapshot.add_snapshot(self.device_manager.lock().unwrap().snapshot()?);
+        vm_snapshot.add_data_section(SnapshotDataSection {
+            id: format!("{}-section", VM_SNAPSHOT_ID),
+            snapshot: vm_snapshot_data,
+        });
+
+        Ok(vm_snapshot)
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
+        let current_state = self
+            .get_state()
+            .map_err(|e| MigratableError::Restore(anyhow!("Could not get VM state: {:#?}", e)))?;
+        let new_state = VmState::Running;
+        current_state.valid_transition(new_state).map_err(|e| {
+            MigratableError::Restore(anyhow!("Could not restore VM state: {:#?}", e))
+        })?;
+
+        if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .restore(*memory_manager_snapshot.clone())?;
+        } else {
+            return Err(MigratableError::Restore(anyhow!(
+                "Missing memory manager snapshot"
+            )));
+        }
+
+        if let Some(device_manager_snapshot) = snapshot.snapshots.get(DEVICE_MANAGER_SNAPSHOT_ID) {
+            self.device_manager
+                .lock()
+                .unwrap()
+                .restore(*device_manager_snapshot.clone())?;
+        } else {
+            return Err(MigratableError::Restore(anyhow!(
+                "Missing device manager snapshot"
+            )));
+        }
+
+        if let Some(cpu_manager_snapshot) = snapshot.snapshots.get(CPU_MANAGER_SNAPSHOT_ID) {
+            self.cpu_manager
+                .lock()
+                .unwrap()
+                .restore(*cpu_manager_snapshot.clone())?;
+        } else {
+            return Err(MigratableError::Restore(anyhow!(
+                "Missing CPU manager snapshot"
+            )));
+        }
+
+        if self
+            .device_manager
+            .lock()
+            .unwrap()
+            .console()
+            .input_enabled()
+        {
+            let console = self.device_manager.lock().unwrap().console().clone();
+            let signals = Signals::new(&[SIGWINCH, SIGINT, SIGTERM]);
+            match signals {
+                Ok(signals) => {
+                    self.signals = Some(signals.clone());
+
+                    let on_tty = self.on_tty;
+                    self.threads.push(
+                        thread::Builder::new()
+                            .name("signal_handler".to_string())
+                            .spawn(move || Vm::os_signal_handler(signals, console, on_tty))
+                            .map_err(|e| {
+                                MigratableError::Restore(anyhow!(
+                                    "Could not start console signal thread: {:#?}",
+                                    e
+                                ))
+                            })?,
+                    );
+                }
+                Err(e) => error!("Signal not found {}", e),
+            }
+
+            if self.on_tty {
+                io::stdin().lock().set_raw_mode().map_err(|e| {
+                    MigratableError::Restore(anyhow!(
+                        "Could not set terminal in raw mode: {:#?}",
+                        e
+                    ))
+                })?;
+            }
+        }
+
+        let mut state = self
+            .state
+            .try_write()
+            .map_err(|e| MigratableError::Restore(anyhow!("Could not set VM state: {:#?}", e)))?;
+        *state = new_state;
+        Ok(())
+    }
+}
+
+impl Transportable for Vm {
+    fn send(
+        &self,
+        snapshot: &Snapshot,
+        destination_url: &str,
+    ) -> std::result::Result<(), MigratableError> {
+        let url = Url::parse(destination_url).map_err(|e| {
+            MigratableError::MigrateSend(anyhow!("Could not parse destination URL: {}", e))
+        })?;
+
+        match url.scheme() {
+            "file" => {
+                let mut vm_snapshot_path = url_to_path(&url)?;
+                vm_snapshot_path.push(VM_SNAPSHOT_FILE);
+
+                // Create the snapshot file
+                let mut vm_snapshot_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(vm_snapshot_path)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                // Serialize and write the snapshot
+                let vm_snapshot = serde_json::to_vec(snapshot)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                vm_snapshot_file
+                    .write(&vm_snapshot)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+                // Tell the memory manager to also send/write its own snapshot.
+                if let Some(memory_manager_snapshot) =
+                    snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID)
+                {
+                    self.memory_manager
+                        .lock()
+                        .unwrap()
+                        .send(&*memory_manager_snapshot.clone(), destination_url)?;
+                } else {
+                    return Err(MigratableError::Restore(anyhow!(
+                        "Missing memory manager snapshot"
+                    )));
+                }
+            }
+            _ => {
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "Unsupported VM transport URL scheme: {}",
+                    url.scheme()
+                )))
+            }
+        }
+        Ok(())
+    }
+}
 impl Migratable for Vm {}
 
 #[cfg(test)]

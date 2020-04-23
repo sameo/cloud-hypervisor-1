@@ -7,12 +7,13 @@ extern crate vm_virtio;
 
 use clap::ArgMatches;
 use net_util::MacAddr;
+use std::collections::HashMap;
 use std::convert::From;
-use std::io;
-use std::net::AddrParseError;
+use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::result;
+use std::str::FromStr;
 
 pub const DEFAULT_VCPUS: u8 = 1;
 pub const DEFAULT_MEMORY_MB: u64 = 512;
@@ -25,93 +26,239 @@ pub const DEFAULT_QUEUE_SIZE_VUBLK: u16 = 128;
 /// Errors associated with VM configuration parameters.
 #[derive(Debug)]
 pub enum Error {
-    /// Failed parsing cpus parameters.
-    ParseCpusParams(std::num::ParseIntError),
-    /// Unexpected vCPU parameter
-    ParseCpusUnknownParam,
-    /// Max is less than boot
-    ParseCpusMaxLowerThanBoot,
-    /// Failed parsing memory file parameter.
-    ParseMemoryFileParam,
-    /// Failed parsing kernel parameters.
-    ParseKernelParams,
-    /// Failed parsing kernel command line parameters.
-    ParseCmdlineParams,
-    /// Failed parsing disks parameters.
-    ParseDisksParams,
-    /// Failed parsing disk queue number parameter.
-    ParseDiskNumQueuesParam(std::num::ParseIntError),
-    /// Failed parsing disk poll_queue parameter.
-    ParseDiskPollQueueParam(std::str::ParseBoolError),
-    /// Failed parsing disk queue size parameter.
-    ParseDiskQueueSizeParam(std::num::ParseIntError),
-    /// Failed to parse vhost parameters
-    ParseDiskVhostParam(std::str::ParseBoolError),
-    /// Failed parsing disk wce parameter.
-    ParseDiskWceParam(std::str::ParseBoolError),
-    /// Failed parsing random number generator parameters.
-    ParseRngParams,
-    /// Failed parsing network ip parameter.
-    ParseNetIpParam(AddrParseError),
-    /// Failed parsing network mask parameter.
-    ParseNetMaskParam(AddrParseError),
-    /// Failed parsing network mac parameter.
-    ParseNetMacParam(io::Error),
-    /// Failed parsing network queue number parameter.
-    ParseNetNumQueuesParam(std::num::ParseIntError),
-    /// Failed parsing network queue size parameter.
-    ParseNetQueueSizeParam(std::num::ParseIntError),
-    /// Failed to parse vhost parameters
-    ParseNetVhostParam(std::str::ParseBoolError),
-    /// Need a vhost socket
-    ParseNetVhostSocketRequired,
-    /// Failed parsing fs tag parameter.
-    ParseFsTagParam,
-    /// Failed parsing fs socket path parameter.
-    ParseFsSockParam,
-    /// Failed parsing fs number of queues parameter.
-    ParseFsNumQueuesParam(std::num::ParseIntError),
-    /// Failed parsing fs queue size parameter.
-    ParseFsQueueSizeParam(std::num::ParseIntError),
-    /// Failed parsing fs dax parameter.
-    ParseFsDax,
+    /// Filesystem tag is missing
+    ParseFsTagMissing,
+    /// Filesystem socket is missing
+    ParseFsSockMissing,
     /// Cannot have dax=off along with cache_size parameter.
     InvalidCacheSizeWithDaxOff,
-    /// Failed parsing persitent memory file parameter.
-    ParsePmemFileParam,
-    /// Failed parsing size parameter.
-    ParseSizeParam(std::num::ParseIntError),
-    /// Failed parsing console parameter.
-    ParseConsoleParam,
-    /// Both console and serial are tty.
-    ParseTTYParam,
-    /// Failed parsing vhost-user-net mac parameter.
-    ParseVuNetMacParam(io::Error),
-    /// Failed parsing vhost-user sock parameter.
-    ParseVuSockParam,
-    /// Failed parsing vhost-user queue number parameter.
-    ParseVuNumQueuesParam(std::num::ParseIntError),
-    /// Failed parsing vhost-user queue size parameter.
-    ParseVuQueueSizeParam(std::num::ParseIntError),
-    /// Failed parsing vhost-user-net server parameter.
-    ParseVuNetServerParam(std::num::ParseIntError),
-    /// Failed parsing vhost-user-blk wce parameter.
-    ParseVuBlkWceParam(std::str::ParseBoolError),
-    /// Failed parsing vsock context ID parameter.
-    ParseVsockCidParam(std::num::ParseIntError),
-    /// Failed parsing vsock socket path parameter.
-    ParseVsockSockParam,
-    /// Missing kernel configuration
-    ValidateMissingKernelConfig,
-    /// Failed parsing generic on|off parameter.
-    ParseOnOff,
+    /// Missing persistant memory file parameter.
+    ParsePmemFileMissing,
+    /// Missing persistant memory size parameter.
+    ParsePmemSizeMissing,
+    /// Missing vsock socket path parameter.
+    ParseVsockSockMissing,
+    /// Missing vsock cid parameter.
+    ParseVsockCidMissing,
+    /// Missing restore source_url parameter.
+    ParseRestoreSourceUrlMissing,
+    /// Error parsing CPU options
+    ParseCpus(OptionParserError),
+    /// Error parsing memory options
+    ParseMemory(OptionParserError),
+    /// Error parsing disk options
+    ParseDisk(OptionParserError),
+    /// Error parsing network options
+    ParseNetwork(OptionParserError),
+    /// Error parsing RNG options
+    ParseRNG(OptionParserError),
+    /// Error parsing filesystem parameters
+    ParseFileSystem(OptionParserError),
+    /// Error parsing persistent memorry parameters
+    ParsePersistentMemory(OptionParserError),
+    /// Failed parsing console
+    ParseConsole(OptionParserError),
+    /// No mode given for console
+    ParseConsoleInvalidModeGiven,
+    /// Failed parsing device parameters
+    ParseDevice(OptionParserError),
+    /// Missing path from device,
+    ParseDevicePathMissing,
+    /// Failed to parse vsock parameters
+    ParseVsock(OptionParserError),
+    /// Failed to parse restore parameters
+    ParseRestore(OptionParserError),
+    /// Failed to validate configuration
+    Validation(ValidationError),
 }
+
+#[derive(Debug)]
+pub enum ValidationError {
+    /// Both console and serial are tty.
+    DoubleTtyMode,
+    /// No kernel specified
+    KernelMissing,
+    /// Missing file value for console
+    ConsoleFileMissing,
+    /// Max is less than boot
+    CpusMaxLowerThanBoot,
+    /// Both socket and path specified
+    DiskSocketAndPath,
+}
+
+type ValidationResult<T> = std::result::Result<T, ValidationError>;
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::ValidationError::*;
+        match self {
+            DoubleTtyMode => write!(f, "Console mode tty specified for both serial and console"),
+            KernelMissing => write!(f, "No kernel specified"),
+            ConsoleFileMissing => write!(f, "Path missing when using file console mode"),
+            CpusMaxLowerThanBoot => write!(f, "Max CPUs greater than boot CPUs"),
+            DiskSocketAndPath => write!(f, "Disk path and vhost socket both provided"),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+        match self {
+            ParseConsole(o) => write!(f, "Error parsing --console: {}", o),
+            ParseConsoleInvalidModeGiven => {
+                write!(f, "Error parsing --console: invalid console mode given")
+            }
+            ParseCpus(o) => write!(f, "Error parsing --cpus: {}", o),
+
+            ParseDevice(o) => write!(f, "Error parsing --device: {}", o),
+            ParseDevicePathMissing => write!(f, "Error parsing --device: path missing"),
+            ParseFileSystem(o) => write!(f, "Error parsing --fs: {}", o),
+            ParseFsSockMissing => write!(f, "Error parsing --fs: sock missing"),
+            ParseFsTagMissing => write!(f, "Error parsing --fs: tag missing"),
+            InvalidCacheSizeWithDaxOff => {
+                write!(f, "Error parsing --fs: cache_size used with dax=on")
+            }
+            ParsePersistentMemory(o) => write!(f, "Error parsing --pmem: {}", o),
+            ParsePmemFileMissing => write!(f, "Error parsing --pmem: file missing"),
+            ParsePmemSizeMissing => write!(f, "Error parsing --pmem: size missing"),
+
+            ParseVsock(o) => write!(f, "Error parsing --vsock: {}", o),
+            ParseVsockCidMissing => write!(f, "Error parsing --vsock: cid missing"),
+            ParseVsockSockMissing => write!(f, "Error parsing --vsock: sock missing"),
+            ParseMemory(o) => write!(f, "Error parsing --memory: {}", o),
+            ParseNetwork(o) => write!(f, "Error parsing --net: {}", o),
+            ParseDisk(o) => write!(f, "Error parsing --disk: {}", o),
+            ParseRNG(o) => write!(f, "Error parsing --rng: {}", o),
+            ParseRestore(o) => write!(f, "Error parsing --restore: {}", o),
+            ParseRestoreSourceUrlMissing => {
+                write!(f, "Error parsing --restore: source_url missing")
+            }
+            Validation(v) => write!(f, "Error validating configuration: {}", v),
+        }
+    }
+}
+
 pub type Result<T> = result::Result<T, Error>;
+
+#[derive(Default)]
+pub struct OptionParser {
+    options: HashMap<String, OptionParserValue>,
+}
+
+struct OptionParserValue {
+    value: Option<String>,
+    requires_value: bool,
+}
+
+#[derive(Debug)]
+pub enum OptionParserError {
+    UnknownOption(String),
+    InvalidSyntax(String),
+    Conversion(String, String),
+}
+
+impl fmt::Display for OptionParserError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            OptionParserError::UnknownOption(s) => write!(f, "unknown option: {}", s),
+            OptionParserError::InvalidSyntax(s) => write!(f, "invalid syntax:{}", s),
+            OptionParserError::Conversion(field, value) => {
+                write!(f, "unable to parse {} for {}", value, field)
+            }
+        }
+    }
+}
+type OptionParserResult<T> = std::result::Result<T, OptionParserError>;
+
+impl OptionParser {
+    pub fn new() -> Self {
+        Self {
+            options: HashMap::new(),
+        }
+    }
+
+    pub fn parse(&mut self, input: &str) -> OptionParserResult<()> {
+        if input.trim().is_empty() {
+            return Ok(());
+        }
+
+        let options_list: Vec<&str> = input.trim().split(',').collect();
+
+        for option in options_list.iter() {
+            let parts: Vec<&str> = option.split('=').collect();
+
+            match self.options.get_mut(parts[0]) {
+                None => return Err(OptionParserError::UnknownOption(parts[0].to_owned())),
+                Some(value) => {
+                    if value.requires_value {
+                        if parts.len() != 2 {
+                            return Err(OptionParserError::InvalidSyntax((*option).to_owned()));
+                        }
+                        value.value = Some(parts[1].trim().to_owned());
+                    } else {
+                        value.value = Some(String::new());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn add(&mut self, option: &str) -> &mut Self {
+        self.options.insert(
+            option.to_owned(),
+            OptionParserValue {
+                value: None,
+                requires_value: true,
+            },
+        );
+
+        self
+    }
+
+    pub fn add_valueless(&mut self, option: &str) -> &mut Self {
+        self.options.insert(
+            option.to_owned(),
+            OptionParserValue {
+                value: None,
+                requires_value: false,
+            },
+        );
+
+        self
+    }
+
+    pub fn get(&self, option: &str) -> Option<String> {
+        self.options
+            .get(option)
+            .and_then(|v| v.value.clone())
+            .and_then(|s| if s.is_empty() { None } else { Some(s) })
+    }
+
+    pub fn is_set(&self, option: &str) -> bool {
+        self.options
+            .get(option)
+            .and_then(|v| v.value.as_ref())
+            .is_some()
+    }
+
+    pub fn convert<T: FromStr>(&self, option: &str) -> OptionParserResult<Option<T>> {
+        match self.get(option) {
+            None => Ok(None),
+            Some(v) => Ok(Some(v.parse().map_err(|_| {
+                OptionParserError::Conversion(option.to_owned(), v.to_owned())
+            })?)),
+        }
+    }
+}
 
 pub struct VmParams<'a> {
     pub cpus: &'a str,
     pub memory: &'a str,
     pub kernel: Option<&'a str>,
+    pub initramfs: Option<&'a str>,
     pub cmdline: Option<&'a str>,
     pub disks: Option<Vec<&'a str>>,
     pub net: Option<Vec<&'a str>>,
@@ -133,6 +280,7 @@ impl<'a> VmParams<'a> {
         let serial = args.value_of("serial").unwrap();
 
         let kernel = args.value_of("kernel");
+        let initramfs = args.value_of("initramfs");
         let cmdline = args.value_of("cmdline");
 
         let disks: Option<Vec<&str>> = args.values_of("disk").map(|x| x.collect());
@@ -147,6 +295,7 @@ impl<'a> VmParams<'a> {
             cpus,
             memory,
             kernel,
+            initramfs,
             cmdline,
             disks,
             net,
@@ -161,35 +310,83 @@ impl<'a> VmParams<'a> {
     }
 }
 
-fn parse_size(size: &str) -> Result<u64> {
-    let s = size.trim();
+struct Toggle(bool);
 
-    let shift = if s.ends_with('K') {
-        10
-    } else if s.ends_with('M') {
-        20
-    } else if s.ends_with('G') {
-        30
-    } else {
-        0
-    };
-
-    let s = s.trim_end_matches(|c| c == 'K' || c == 'M' || c == 'G');
-    let res = s.parse::<u64>().map_err(Error::ParseSizeParam)?;
-    Ok(res << shift)
+enum ToggleParseError {
+    InvalidValue(String),
 }
 
-fn parse_on_off(param: &str) -> Result<bool> {
-    if !param.is_empty() {
-        let res = match param {
-            "on" => true,
-            "off" => false,
-            _ => return Err(Error::ParseOnOff),
-        };
+impl FromStr for Toggle {
+    type Err = ToggleParseError;
 
-        Ok(res)
-    } else {
-        Ok(false)
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "" => Ok(Toggle(false)),
+            "on" => Ok(Toggle(true)),
+            "off" => Ok(Toggle(false)),
+            "true" => Ok(Toggle(true)),
+            "false" => Ok(Toggle(false)),
+            _ => Err(ToggleParseError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub enum HotplugMethod {
+    Acpi,
+    VirtioMem,
+}
+
+impl Default for HotplugMethod {
+    fn default() -> Self {
+        HotplugMethod::Acpi
+    }
+}
+
+#[derive(Debug)]
+pub enum ParseHotplugMethodError {
+    InvalidValue(String),
+}
+
+impl FromStr for HotplugMethod {
+    type Err = ParseHotplugMethodError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "acpi" => Ok(HotplugMethod::Acpi),
+            "virtio-mem" => Ok(HotplugMethod::VirtioMem),
+            _ => Err(ParseHotplugMethodError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
+struct ByteSized(u64);
+
+enum ByteSizedParseError {
+    InvalidValue(String),
+}
+
+impl FromStr for ByteSized {
+    type Err = ByteSizedParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(ByteSized({
+            let s = s.trim();
+            let shift = if s.ends_with('K') {
+                10
+            } else if s.ends_with('M') {
+                20
+            } else if s.ends_with('G') {
+                30
+            } else {
+                0
+            };
+
+            let s = s.trim_end_matches(|c| c == 'K' || c == 'M' || c == 'G');
+            s.parse::<u64>()
+                .map_err(|_| ByteSizedParseError::InvalidValue(s.to_owned()))?
+                << shift
+        }))
     }
 }
 
@@ -201,32 +398,18 @@ pub struct CpusConfig {
 
 impl CpusConfig {
     pub fn parse(cpus: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = cpus.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser.add("boot").add("max");
+        parser.parse(cpus).map_err(Error::ParseCpus)?;
 
-        let mut boot_str: &str = "";
-        let mut max_str: &str = "";
-
-        for param in params_list.iter() {
-            if param.starts_with("boot=") {
-                boot_str = &param["boot=".len()..];
-            } else if param.starts_with("max=") {
-                max_str = &param["max=".len()..];
-            } else {
-                return Err(Error::ParseCpusUnknownParam);
-            }
-        }
-
-        let boot_vcpus: u8 = boot_str.parse().map_err(Error::ParseCpusParams)?;
-        let max_vcpus = if max_str != "" {
-            max_str.parse().map_err(Error::ParseCpusParams)?
-        } else {
-            boot_vcpus
-        };
-
-        if max_vcpus < boot_vcpus {
-            return Err(Error::ParseCpusMaxLowerThanBoot);
-        }
+        let boot_vcpus: u8 = parser
+            .convert("boot")
+            .map_err(Error::ParseCpus)?
+            .unwrap_or(DEFAULT_VCPUS);
+        let max_vcpus: u8 = parser
+            .convert("max")
+            .map_err(Error::ParseCpus)?
+            .unwrap_or(boot_vcpus);
 
         Ok(CpusConfig {
             boot_vcpus,
@@ -252,52 +435,48 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub mergeable: bool,
     #[serde(default)]
+    pub hotplug_method: HotplugMethod,
+    #[serde(default)]
     pub hotplug_size: Option<u64>,
 }
 
 impl MemoryConfig {
     pub fn parse(memory: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = memory.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser
+            .add("size")
+            .add("file")
+            .add("mergeable")
+            .add("hotplug_method")
+            .add("hotplug_size");
+        parser.parse(memory).map_err(Error::ParseMemory)?;
 
-        let mut size_str: &str = "";
-        let mut file_str: &str = "";
-        let mut mergeable_str: &str = "";
-        let mut backed = false;
-        let mut hotplug_str: &str = "";
-
-        for param in params_list.iter() {
-            if param.starts_with("size=") {
-                size_str = &param[5..];
-            } else if param.starts_with("file=") {
-                backed = true;
-                file_str = &param[5..];
-            } else if param.starts_with("mergeable=") {
-                mergeable_str = &param[10..];
-            } else if param.starts_with("hotplug_size=") {
-                hotplug_str = &param[13..]
-            }
-        }
-
-        let file = if backed {
-            if file_str.is_empty() {
-                return Err(Error::ParseMemoryFileParam);
-            }
-
-            Some(PathBuf::from(file_str))
-        } else {
-            None
-        };
+        let size = parser
+            .convert::<ByteSized>("size")
+            .map_err(Error::ParseMemory)?
+            .unwrap_or(ByteSized(DEFAULT_MEMORY_MB << 20))
+            .0;
+        let file = parser.get("file").map(PathBuf::from);
+        let mergeable = parser
+            .convert::<Toggle>("mergeable")
+            .map_err(Error::ParseMemory)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let hotplug_method = parser
+            .convert("hotplug_method")
+            .map_err(Error::ParseMemory)?
+            .unwrap_or_default();
+        let hotplug_size = parser
+            .convert::<ByteSized>("hotplug_size")
+            .map_err(Error::ParseMemory)?
+            .map(|v| v.0);
 
         Ok(MemoryConfig {
-            size: parse_size(size_str)?,
+            size,
             file,
-            mergeable: parse_on_off(mergeable_str)?,
-            hotplug_size: if hotplug_str == "" {
-                None
-            } else {
-                Some(parse_size(hotplug_str)?)
-            },
+            mergeable,
+            hotplug_method,
+            hotplug_size,
         })
     }
 }
@@ -308,6 +487,7 @@ impl Default for MemoryConfig {
             size: DEFAULT_MEMORY_MB << 20,
             file: None,
             mergeable: false,
+            hotplug_method: HotplugMethod::Acpi,
             hotplug_size: None,
         }
     }
@@ -315,6 +495,11 @@ impl Default for MemoryConfig {
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct KernelConfig {
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct InitramfsConfig {
     pub path: PathBuf,
 }
 
@@ -335,7 +520,7 @@ impl CmdlineConfig {
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct DiskConfig {
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     #[serde(default)]
     pub readonly: bool,
     #[serde(default)]
@@ -353,6 +538,8 @@ pub struct DiskConfig {
     pub wce: bool,
     #[serde(default = "default_diskconfig_poll_queue")]
     pub poll_queue: bool,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 fn default_diskconfig_num_queues() -> usize {
@@ -371,95 +558,105 @@ fn default_diskconfig_poll_queue() -> bool {
     true
 }
 
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            readonly: false,
+            direct: false,
+            iommu: false,
+            num_queues: default_diskconfig_num_queues(),
+            queue_size: default_diskconfig_queue_size(),
+            vhost_user: false,
+            vhost_socket: None,
+            wce: default_diskconfig_wce(),
+            poll_queue: default_diskconfig_poll_queue(),
+            id: None,
+        }
+    }
+}
+
 impl DiskConfig {
+    pub const SYNTAX: &'static str = "Disk parameters \
+         \"path=<disk_image_path>,readonly=on|off,iommu=on|off,num_queues=<number_of_queues>,\
+         queue_size=<size_of_each_queue>,vhost_user=<vhost_user_enable>,\
+         socket=<vhost_user_socket_path>,wce=<true|false, default true>,id=<device_id>\"";
+
     pub fn parse(disk: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = disk.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser
+            .add("path")
+            .add("readonly")
+            .add("direct")
+            .add("iommu")
+            .add("queue_size")
+            .add("num_queues")
+            .add("vhost_user")
+            .add("socket")
+            .add("wce")
+            .add("poll_queue")
+            .add("id");
+        parser.parse(disk).map_err(Error::ParseDisk)?;
 
-        let mut path_str: &str = "";
-        let mut readonly_str: &str = "";
-        let mut direct_str: &str = "";
-        let mut iommu_str: &str = "";
-        let mut num_queues_str: &str = "";
-        let mut queue_size_str: &str = "";
-        let mut vhost_socket_str: &str = "";
-        let mut vhost_user_str: &str = "";
-        let mut wce_str: &str = "";
-        let mut poll_queue_str: &str = "";
+        let path = parser.get("path").map(PathBuf::from);
+        let readonly = parser
+            .convert::<Toggle>("readonly")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let direct = parser
+            .convert::<Toggle>("direct")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let iommu = parser
+            .convert::<Toggle>("iommu")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let queue_size = parser
+            .convert("queue_size")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_else(default_diskconfig_queue_size);
+        let num_queues = parser
+            .convert("num_queues")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_else(default_diskconfig_num_queues);
+        let vhost_user = parser
+            .convert("vhost_user")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or(false);
+        let vhost_socket = parser.get("socket");
+        let wce = parser
+            .convert("wce")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_else(default_diskconfig_wce);
+        let poll_queue = parser
+            .convert("poll_queue")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_else(default_diskconfig_poll_queue);
+        let id = parser.get("id");
 
-        for param in params_list.iter() {
-            if param.starts_with("path=") {
-                path_str = &param[5..];
-            } else if param.starts_with("readonly=") {
-                readonly_str = &param[9..];
-            } else if param.starts_with("direct=") {
-                direct_str = &param[7..];
-            } else if param.starts_with("iommu=") {
-                iommu_str = &param[6..];
-            } else if param.starts_with("num_queues=") {
-                num_queues_str = &param[11..];
-            } else if param.starts_with("queue_size=") {
-                queue_size_str = &param[11..];
-            } else if param.starts_with("vhost_user=") {
-                vhost_user_str = &param[11..];
-            } else if param.starts_with("socket=") {
-                vhost_socket_str = &param[7..];
-            } else if param.starts_with("wce=") {
-                wce_str = &param[4..];
-            } else if param.starts_with("poll_queue=") {
-                poll_queue_str = &param[11..];
-            }
+        if parser.is_set("wce") && !vhost_user {
+            warn!("wce parameter currently only has effect when used vhost_user=true");
         }
 
-        let mut num_queues: usize = default_diskconfig_num_queues();
-        let mut queue_size: u16 = default_diskconfig_queue_size();
-        let mut vhost_user = false;
-        let mut vhost_socket = None;
-        let mut wce: bool = default_diskconfig_wce();
-        let mut poll_queue: bool = default_diskconfig_poll_queue();
-
-        if !num_queues_str.is_empty() {
-            num_queues = num_queues_str
-                .parse()
-                .map_err(Error::ParseDiskNumQueuesParam)?;
-        }
-        if !queue_size_str.is_empty() {
-            queue_size = queue_size_str
-                .parse()
-                .map_err(Error::ParseDiskQueueSizeParam)?;
-        }
-        if !vhost_user_str.is_empty() {
-            vhost_user = vhost_user_str.parse().map_err(Error::ParseDiskVhostParam)?;
-        }
-        if !vhost_socket_str.is_empty() {
-            vhost_socket = Some(vhost_socket_str.to_owned());
-        }
-        if !wce_str.is_empty() {
-            if !vhost_user {
-                warn!("wce parameter currently only has effect when used vhost_user=true");
-            }
-            wce = wce_str.parse().map_err(Error::ParseDiskWceParam)?;
-        }
-        if !poll_queue_str.is_empty() {
-            if !vhost_user {
-                warn!("poll_queue parameter currently only has effect when used vhost_user=true");
-            }
-            poll_queue = poll_queue_str
-                .parse()
-                .map_err(Error::ParseDiskPollQueueParam)?;
+        if parser.is_set("poll_queue") && !vhost_user {
+            warn!("poll_queue parameter currently only has effect when used vhost_user=true");
         }
 
         Ok(DiskConfig {
-            path: PathBuf::from(path_str),
-            readonly: parse_on_off(readonly_str)?,
-            direct: parse_on_off(direct_str)?,
-            iommu: parse_on_off(iommu_str)?,
+            path,
+            readonly,
+            direct,
+            iommu,
             num_queues,
             queue_size,
             vhost_socket,
             vhost_user,
             wce,
             poll_queue,
+            id,
         })
     }
 }
@@ -483,6 +680,8 @@ pub struct NetConfig {
     #[serde(default)]
     pub vhost_user: bool,
     pub vhost_socket: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 fn default_netconfig_tap() -> Option<String> {
@@ -509,81 +708,77 @@ fn default_netconfig_queue_size() -> u16 {
     DEFAULT_QUEUE_SIZE_VUNET
 }
 
+impl Default for NetConfig {
+    fn default() -> Self {
+        Self {
+            tap: default_netconfig_tap(),
+            ip: default_netconfig_ip(),
+            mask: default_netconfig_mask(),
+            mac: default_netconfig_mac(),
+            iommu: false,
+            num_queues: default_netconfig_num_queues(),
+            queue_size: default_netconfig_queue_size(),
+            vhost_user: false,
+            vhost_socket: None,
+            id: None,
+        }
+    }
+}
+
 impl NetConfig {
+    pub const SYNTAX: &'static str = "Network parameters \
+    \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,iommu=on|off,\
+    num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
+    vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,id=<device_id>\"";
+
     pub fn parse(net: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = net.split(',').collect();
+        let mut parser = OptionParser::new();
 
-        let mut tap_str: &str = "";
-        let mut ip_str: &str = "";
-        let mut mask_str: &str = "";
-        let mut mac_str: &str = "";
-        let mut iommu_str: &str = "";
-        let mut num_queues_str: &str = "";
-        let mut queue_size_str: &str = "";
-        let mut vhost_socket_str: &str = "";
-        let mut vhost_user_str: &str = "";
+        parser
+            .add("tap")
+            .add("ip")
+            .add("mask")
+            .add("mac")
+            .add("iommu")
+            .add("queue_size")
+            .add("num_queues")
+            .add("vhost_user")
+            .add("socket")
+            .add("id");
+        parser.parse(net).map_err(Error::ParseNetwork)?;
 
-        for param in params_list.iter() {
-            if param.starts_with("tap=") {
-                tap_str = &param[4..];
-            } else if param.starts_with("ip=") {
-                ip_str = &param[3..];
-            } else if param.starts_with("mask=") {
-                mask_str = &param[5..];
-            } else if param.starts_with("mac=") {
-                mac_str = &param[4..];
-            } else if param.starts_with("iommu=") {
-                iommu_str = &param[6..];
-            } else if param.starts_with("num_queues=") {
-                num_queues_str = &param[11..];
-            } else if param.starts_with("queue_size=") {
-                queue_size_str = &param[11..];
-            } else if param.starts_with("vhost_user=") {
-                vhost_user_str = &param[11..];
-            } else if param.starts_with("socket=") {
-                vhost_socket_str = &param[7..];
-            }
-        }
-
-        let mut tap: Option<String> = default_netconfig_tap();
-        let mut ip: Ipv4Addr = default_netconfig_ip();
-        let mut mask: Ipv4Addr = default_netconfig_mask();
-        let mut mac: MacAddr = default_netconfig_mac();
-        let iommu = parse_on_off(iommu_str)?;
-        let mut num_queues: usize = default_netconfig_num_queues();
-        let mut queue_size: u16 = default_netconfig_queue_size();
-        let mut vhost_user = false;
-        let mut vhost_socket = None;
-
-        if !tap_str.is_empty() {
-            tap = Some(tap_str.to_string());
-        }
-        if !ip_str.is_empty() {
-            ip = ip_str.parse().map_err(Error::ParseNetIpParam)?;
-        }
-        if !mask_str.is_empty() {
-            mask = mask_str.parse().map_err(Error::ParseNetMaskParam)?;
-        }
-        if !mac_str.is_empty() {
-            mac = MacAddr::parse_str(mac_str).map_err(Error::ParseNetMacParam)?;
-        }
-        if !num_queues_str.is_empty() {
-            num_queues = num_queues_str
-                .parse()
-                .map_err(Error::ParseNetNumQueuesParam)?;
-        }
-        if !queue_size_str.is_empty() {
-            queue_size = queue_size_str
-                .parse()
-                .map_err(Error::ParseNetQueueSizeParam)?;
-        }
-        if !vhost_user_str.is_empty() {
-            vhost_user = vhost_user_str.parse().map_err(Error::ParseNetVhostParam)?;
-        }
-        if !vhost_socket_str.is_empty() {
-            vhost_socket = Some(vhost_socket_str.to_owned());
-        }
+        let tap = parser.get("tap");
+        let ip = parser
+            .convert("ip")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or_else(default_netconfig_ip);
+        let mask = parser
+            .convert("mask")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or_else(default_netconfig_mask);
+        let mac = parser
+            .convert("mac")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or_else(default_netconfig_mac);
+        let iommu = parser
+            .convert::<Toggle>("iommu")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let queue_size = parser
+            .convert("queue_size")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or_else(default_netconfig_queue_size);
+        let num_queues = parser
+            .convert("num_queues")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or_else(default_netconfig_num_queues);
+        let vhost_user = parser
+            .convert("vhost_user")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(false);
+        let vhost_socket = parser.get("socket");
+        let id = parser.get("id");
 
         Ok(NetConfig {
             tap,
@@ -595,6 +790,7 @@ impl NetConfig {
             queue_size,
             vhost_user,
             vhost_socket,
+            id,
         })
     }
 }
@@ -608,24 +804,22 @@ pub struct RngConfig {
 
 impl RngConfig {
     pub fn parse(rng: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = rng.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser.add("src").add("iommu");
+        parser.parse(rng).map_err(Error::ParseRNG)?;
 
-        let mut src_str: &str = "";
-        let mut iommu_str: &str = "";
+        let src = PathBuf::from(
+            parser
+                .get("src")
+                .unwrap_or_else(|| DEFAULT_RNG_SOURCE.to_owned()),
+        );
+        let iommu = parser
+            .convert::<Toggle>("iommu")
+            .map_err(Error::ParseRNG)?
+            .unwrap_or(Toggle(false))
+            .0;
 
-        for param in params_list.iter() {
-            if param.starts_with("src=") {
-                src_str = &param[4..];
-            } else if param.starts_with("iommu=") {
-                iommu_str = &param[6..];
-            }
-        }
-
-        Ok(RngConfig {
-            src: PathBuf::from(src_str),
-            iommu: parse_on_off(iommu_str)?,
-        })
+        Ok(RngConfig { src, iommu })
     }
 }
 
@@ -668,78 +862,67 @@ fn default_fsconfig_cache_size() -> u64 {
     0x0002_0000_0000
 }
 
+impl Default for FsConfig {
+    fn default() -> Self {
+        Self {
+            tag: "".to_owned(),
+            sock: PathBuf::new(),
+            num_queues: default_fsconfig_num_queues(),
+            queue_size: default_fsconfig_queue_size(),
+            dax: default_fsconfig_dax(),
+            cache_size: default_fsconfig_cache_size(),
+        }
+    }
+}
+
 impl FsConfig {
+    pub const SYNTAX: &'static str = "virtio-fs parameters \
+    \"tag=<tag_name>,sock=<socket_path>,num_queues=<number_of_queues>,\
+    queue_size=<size_of_each_queue>,dax=on|off,cache_size=<DAX cache size: \
+    default 8Gib>\"";
+
     pub fn parse(fs: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = fs.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser
+            .add("tag")
+            .add("dax")
+            .add("cache_size")
+            .add("queue_size")
+            .add("num_queues")
+            .add("sock");
+        parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
-        let mut tag: &str = "";
-        let mut sock: &str = "";
-        let mut num_queues_str: &str = "";
-        let mut queue_size_str: &str = "";
-        let mut dax_str: &str = "";
-        let mut cache_size_str: &str = "";
+        let tag = parser.get("tag").ok_or(Error::ParseFsTagMissing)?;
+        let sock = PathBuf::from(parser.get("sock").ok_or(Error::ParseFsSockMissing)?);
 
-        for param in params_list.iter() {
-            if param.starts_with("tag=") {
-                tag = &param[4..];
-            } else if param.starts_with("sock=") {
-                sock = &param[5..];
-            } else if param.starts_with("num_queues=") {
-                num_queues_str = &param[11..];
-            } else if param.starts_with("queue_size=") {
-                queue_size_str = &param[11..];
-            } else if param.starts_with("dax=") {
-                dax_str = &param[4..];
-            } else if param.starts_with("cache_size=") {
-                cache_size_str = &param[11..];
-            }
-        }
+        let queue_size = parser
+            .convert("queue_size")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(default_fsconfig_queue_size);
+        let num_queues = parser
+            .convert("num_queues")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(default_fsconfig_num_queues);
 
-        let mut num_queues: usize = default_fsconfig_num_queues();
-        let mut queue_size: u16 = default_fsconfig_queue_size();
-        let mut dax: bool = default_fsconfig_dax();
-        // Default cache size set to 8Gib.
-        let mut cache_size: u64 = default_fsconfig_cache_size();
+        let dax = parser
+            .convert::<Toggle>("dax")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(|| Toggle(default_fsconfig_dax()))
+            .0;
 
-        if tag.is_empty() {
-            return Err(Error::ParseFsTagParam);
-        }
-        if sock.is_empty() {
-            return Err(Error::ParseFsSockParam);
-        }
-        if !num_queues_str.is_empty() {
-            num_queues = num_queues_str
-                .parse()
-                .map_err(Error::ParseFsNumQueuesParam)?;
-        }
-        if !queue_size_str.is_empty() {
-            queue_size = queue_size_str
-                .parse()
-                .map_err(Error::ParseFsQueueSizeParam)?;
-        }
-        if !dax_str.is_empty() {
-            match dax_str {
-                "on" => dax = true,
-                "off" => dax = false,
-                _ => return Err(Error::ParseFsDax),
-            }
+        if parser.is_set("cache_size") && !dax {
+            return Err(Error::InvalidCacheSizeWithDaxOff);
         }
 
-        // Take appropriate decision about cache_size based on DAX being
-        // enabled or disabled.
-        if !dax {
-            if !cache_size_str.is_empty() {
-                return Err(Error::InvalidCacheSizeWithDaxOff);
-            }
-            cache_size = 0;
-        } else if !cache_size_str.is_empty() {
-            cache_size = parse_size(cache_size_str)?;
-        }
+        let cache_size = parser
+            .convert::<ByteSized>("cache_size")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(|| ByteSized(default_fsconfig_cache_size()))
+            .0;
 
         Ok(FsConfig {
-            tag: tag.to_string(),
-            sock: PathBuf::from(sock),
+            tag,
+            sock,
             num_queues,
             queue_size,
             dax,
@@ -748,7 +931,7 @@ impl FsConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Default)]
 pub struct PmemConfig {
     pub file: PathBuf,
     pub size: u64,
@@ -756,39 +939,57 @@ pub struct PmemConfig {
     pub iommu: bool,
     #[serde(default)]
     pub mergeable: bool,
+    #[serde(default)]
+    pub discard_writes: bool,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 impl PmemConfig {
+    pub const SYNTAX: &'static str = "Persistent memory parameters \
+    \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=on|off,\
+    mergeable=on|off,discard_writes=on|off,id=<device_id>\"";
     pub fn parse(pmem: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = pmem.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser
+            .add("size")
+            .add("file")
+            .add("mergeable")
+            .add("iommu")
+            .add("discard_writes")
+            .add("id");
+        parser.parse(pmem).map_err(Error::ParsePersistentMemory)?;
 
-        let mut file_str: &str = "";
-        let mut size_str: &str = "";
-        let mut iommu_str: &str = "";
-        let mut mergeable_str: &str = "";
-
-        for param in params_list.iter() {
-            if param.starts_with("file=") {
-                file_str = &param[5..];
-            } else if param.starts_with("size=") {
-                size_str = &param[5..];
-            } else if param.starts_with("iommu=") {
-                iommu_str = &param[6..];
-            } else if param.starts_with("mergeable=") {
-                mergeable_str = &param[10..];
-            }
-        }
-
-        if file_str.is_empty() {
-            return Err(Error::ParsePmemFileParam);
-        }
+        let file = PathBuf::from(parser.get("file").ok_or(Error::ParsePmemFileMissing)?);
+        let size = parser
+            .convert::<ByteSized>("size")
+            .map_err(Error::ParseMemory)?
+            .ok_or(Error::ParsePmemSizeMissing)?
+            .0;
+        let mergeable = parser
+            .convert::<Toggle>("mergeable")
+            .map_err(Error::ParsePersistentMemory)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let iommu = parser
+            .convert::<Toggle>("iommu")
+            .map_err(Error::ParsePersistentMemory)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let discard_writes = parser
+            .convert::<Toggle>("discard_writes")
+            .map_err(Error::ParsePersistentMemory)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let id = parser.get("id");
 
         Ok(PmemConfig {
-            file: PathBuf::from(file_str),
-            size: parse_size(size_str)?,
-            iommu: parse_on_off(iommu_str)?,
-            mergeable: parse_on_off(mergeable_str)?,
+            file,
+            size,
+            iommu,
+            mergeable,
+            discard_writes,
+            id,
         })
     }
 }
@@ -825,46 +1026,39 @@ fn default_consoleconfig_file() -> Option<PathBuf> {
 
 impl ConsoleConfig {
     pub fn parse(console: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = console.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser
+            .add_valueless("off")
+            .add_valueless("tty")
+            .add_valueless("null")
+            .add("file")
+            .add("iommu");
+        parser.parse(console).map_err(Error::ParseConsole)?;
 
-        let mut valid = false;
         let mut file: Option<PathBuf> = default_consoleconfig_file();
         let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
-        let mut iommu_str: &str = "";
 
-        for param in params_list.iter() {
-            if param.starts_with("iommu=") {
-                iommu_str = &param[6..];
-            } else {
-                if *param == "off" {
-                    mode = ConsoleOutputMode::Off;
-                    file = None;
-                } else if *param == "tty" {
-                    mode = ConsoleOutputMode::Tty;
-                    file = None;
-                } else if param.starts_with("file=") {
-                    mode = ConsoleOutputMode::File;
-                    file = Some(PathBuf::from(&param[5..]));
-                } else if param.starts_with("null") {
-                    mode = ConsoleOutputMode::Null;
-                    file = None;
-                } else {
-                    return Err(Error::ParseConsoleParam);
-                }
-                valid = true;
-            }
+        if parser.is_set("off") {
+        } else if parser.is_set("tty") {
+            mode = ConsoleOutputMode::Tty
+        } else if parser.is_set("null") {
+            mode = ConsoleOutputMode::Null
+        } else if parser.is_set("file") {
+            mode = ConsoleOutputMode::File;
+            file =
+                Some(PathBuf::from(parser.get("file").ok_or(
+                    Error::Validation(ValidationError::ConsoleFileMissing),
+                )?));
+        } else {
+            return Err(Error::ParseConsoleInvalidModeGiven);
         }
+        let iommu = parser
+            .convert::<Toggle>("iommu")
+            .map_err(Error::ParseConsole)?
+            .unwrap_or(Toggle(false))
+            .0;
 
-        if !valid {
-            return Err(Error::ParseConsoleParam);
-        }
-
-        Ok(Self {
-            mode,
-            file,
-            iommu: parse_on_off(iommu_str)?,
-        })
+        Ok(Self { mode, file, iommu })
     }
 
     pub fn default_serial() -> Self {
@@ -894,35 +1088,24 @@ pub struct DeviceConfig {
 }
 
 impl DeviceConfig {
+    pub const SYNTAX: &'static str =
+        "Direct device assignment parameters \"path=<device_path>,iommu=on|off,id=<device_id>\"";
     pub fn parse(device: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = device.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser.add("path").add("id").add("iommu");
+        parser.parse(device).map_err(Error::ParseDevice)?;
 
-        let mut path_str: &str = "";
-        let mut iommu_str: &str = "";
-        let mut id_str: &str = "";
-
-        for param in params_list.iter() {
-            if param.starts_with("path=") {
-                path_str = &param[5..];
-            } else if param.starts_with("iommu=") {
-                iommu_str = &param[6..];
-            } else if param.starts_with("id=") {
-                id_str = &param[3..];
-            }
-        }
-
-        let id = if !id_str.is_empty() {
-            Some(String::from(id_str))
-        } else {
-            None
-        };
-
-        Ok(DeviceConfig {
-            path: PathBuf::from(path_str),
-            iommu: parse_on_off(iommu_str)?,
-            id,
-        })
+        let path = parser
+            .get("path")
+            .map(PathBuf::from)
+            .ok_or(Error::ParseDevicePathMissing)?;
+        let iommu = parser
+            .convert::<Toggle>("iommu")
+            .map_err(Error::ParseDevice)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let id = parser.get("id");
+        Ok(DeviceConfig { path, iommu, id })
     }
 }
 
@@ -936,31 +1119,58 @@ pub struct VsockConfig {
 
 impl VsockConfig {
     pub fn parse(vsock: &str) -> Result<Self> {
-        // Split the parameters based on the comma delimiter
-        let params_list: Vec<&str> = vsock.split(',').collect();
+        let mut parser = OptionParser::new();
+        parser.add("sock").add("cid").add("iommu");
+        parser.parse(vsock).map_err(Error::ParseVsock)?;
 
-        let mut cid_str: &str = "";
-        let mut sock_str: &str = "";
-        let mut iommu_str: &str = "";
+        let sock = parser
+            .get("sock")
+            .map(PathBuf::from)
+            .ok_or(Error::ParseVsockSockMissing)?;
+        let iommu = parser
+            .convert::<Toggle>("iommu")
+            .map_err(Error::ParseVsock)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let cid = parser
+            .convert("cid")
+            .map_err(Error::ParseVsock)?
+            .ok_or(Error::ParseVsockCidMissing)?;
 
-        for param in params_list.iter() {
-            if param.starts_with("cid=") {
-                cid_str = &param[4..];
-            } else if param.starts_with("sock=") {
-                sock_str = &param[5..];
-            } else if param.starts_with("iommu=") {
-                iommu_str = &param[6..];
-            }
-        }
+        Ok(VsockConfig { cid, sock, iommu })
+    }
+}
 
-        if sock_str.is_empty() {
-            return Err(Error::ParseVsockSockParam);
-        }
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct RestoreConfig {
+    pub source_url: PathBuf,
+    #[serde(default)]
+    pub prefault: bool,
+}
 
-        Ok(VsockConfig {
-            cid: cid_str.parse::<u64>().map_err(Error::ParseVsockCidParam)?,
-            sock: PathBuf::from(sock_str),
-            iommu: parse_on_off(iommu_str)?,
+impl RestoreConfig {
+    pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off\" \
+        \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
+        \n`prefault` brings memory pages in when enabled (disabled by default)";
+    pub fn parse(restore: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser.add("source_url").add("prefault");
+        parser.parse(restore).map_err(Error::ParseRestore)?;
+
+        let source_url = parser
+            .get("source_url")
+            .map(PathBuf::from)
+            .ok_or(Error::ParseRestoreSourceUrlMissing)?;
+        let prefault = parser
+            .convert::<Toggle>("prefault")
+            .map_err(Error::ParseRestore)?
+            .unwrap_or(Toggle(false))
+            .0;
+
+        Ok(RestoreConfig {
+            source_url,
+            prefault,
         })
     }
 }
@@ -972,6 +1182,8 @@ pub struct VmConfig {
     #[serde(default)]
     pub memory: MemoryConfig,
     pub kernel: Option<KernelConfig>,
+    #[serde(default)]
+    pub initramfs: Option<InitramfsConfig>,
     #[serde(default)]
     pub cmdline: CmdlineConfig,
     pub disks: Option<Vec<DiskConfig>>,
@@ -991,8 +1203,35 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
-    pub fn valid(&self) -> bool {
-        self.kernel.is_some()
+    pub fn validate(&self) -> ValidationResult<()> {
+        self.kernel.as_ref().ok_or(ValidationError::KernelMissing)?;
+
+        if self.console.mode == ConsoleOutputMode::Tty && self.serial.mode == ConsoleOutputMode::Tty
+        {
+            return Err(ValidationError::DoubleTtyMode);
+        }
+
+        if self.console.mode == ConsoleOutputMode::File && self.console.file.is_none() {
+            return Err(ValidationError::ConsoleFileMissing);
+        }
+
+        if self.serial.mode == ConsoleOutputMode::File && self.serial.file.is_none() {
+            return Err(ValidationError::ConsoleFileMissing);
+        }
+
+        if self.cpus.max_vcpus < self.cpus.boot_vcpus {
+            return Err(ValidationError::CpusMaxLowerThanBoot);
+        }
+
+        if let Some(disks) = &self.disks {
+            for disk in disks {
+                if disk.vhost_socket.as_ref().and(disk.path.as_ref()).is_some() {
+                    return Err(ValidationError::DiskSocketAndPath);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn parse(vm_params: VmParams) -> Result<Self> {
@@ -1056,9 +1295,6 @@ impl VmConfig {
             iommu = true;
         }
         let serial = ConsoleConfig::parse(vm_params.serial)?;
-        if console.mode == ConsoleOutputMode::Tty && serial.mode == ConsoleOutputMode::Tty {
-            return Err(Error::ParseTTYParam);
-        }
 
         let mut devices: Option<Vec<DeviceConfig>> = None;
         if let Some(device_list) = &vm_params.devices {
@@ -1093,10 +1329,18 @@ impl VmConfig {
             });
         }
 
-        Ok(VmConfig {
+        let mut initramfs: Option<InitramfsConfig> = None;
+        if let Some(k) = vm_params.initramfs {
+            initramfs = Some(InitramfsConfig {
+                path: PathBuf::from(k),
+            });
+        }
+
+        let config = VmConfig {
             cpus: CpusConfig::parse(vm_params.cpus)?,
             memory: MemoryConfig::parse(vm_params.memory)?,
             kernel,
+            initramfs,
             cmdline: CmdlineConfig::parse(vm_params.cmdline)?,
             disks,
             net,
@@ -1108,6 +1352,583 @@ impl VmConfig {
             devices,
             vsock,
             iommu,
-        })
+        };
+        config.validate().map_err(Error::Validation)?;
+        Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_option_parser() -> std::result::Result<(), OptionParserError> {
+        let mut parser = OptionParser::new();
+        parser
+            .add("size")
+            .add("file")
+            .add("mergeable")
+            .add("hotplug_method")
+            .add("hotplug_size");
+
+        assert!(parser
+            .parse("size=128M,file=/dev/shm,hanging_param")
+            .is_err());
+        assert!(parser
+            .parse("size=128M,file=/dev/shm,too_many_equals=foo=bar")
+            .is_err());
+        assert!(parser.parse("size=128M,file=/dev/shm").is_ok());
+
+        assert_eq!(parser.get("size"), Some("128M".to_owned()));
+        assert_eq!(parser.get("file"), Some("/dev/shm".to_owned()));
+        assert!(!parser.is_set("mergeable"));
+        assert!(parser.is_set("size"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cpu_parsing() -> Result<()> {
+        assert_eq!(CpusConfig::parse("")?, CpusConfig::default());
+
+        assert_eq!(
+            CpusConfig::parse("boot=1")?,
+            CpusConfig {
+                boot_vcpus: 1,
+                max_vcpus: 1
+            }
+        );
+        assert_eq!(
+            CpusConfig::parse("boot=1,max=2")?,
+            CpusConfig {
+                boot_vcpus: 1,
+                max_vcpus: 2,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mem_parsing() -> Result<()> {
+        assert_eq!(MemoryConfig::parse("")?, MemoryConfig::default());
+        // Default string
+        assert_eq!(MemoryConfig::parse("size=512M")?, MemoryConfig::default());
+        assert_eq!(
+            MemoryConfig::parse("size=512M,file=/some/file")?,
+            MemoryConfig {
+                size: 512 << 20,
+                file: Some(PathBuf::from("/some/file")),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            MemoryConfig::parse("size=512M,mergeable=on")?,
+            MemoryConfig {
+                size: 512 << 20,
+                mergeable: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            MemoryConfig::parse("mergeable=on")?,
+            MemoryConfig {
+                mergeable: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            MemoryConfig::parse("size=1G,mergeable=off")?,
+            MemoryConfig {
+                size: 1 << 30,
+                mergeable: false,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            MemoryConfig::parse("hotplug_method=acpi")?,
+            MemoryConfig {
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            MemoryConfig::parse("hotplug_method=acpi,hotplug_size=512M")?,
+            MemoryConfig {
+                hotplug_size: Some(512 << 20),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            MemoryConfig::parse("hotplug_method=virtio-mem,hotplug_size=512M")?,
+            MemoryConfig {
+                hotplug_size: Some(512 << 20),
+                hotplug_method: HotplugMethod::VirtioMem,
+                ..Default::default()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_parsing() -> Result<()> {
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,id=mydisk0")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                id: Some("mydisk0".to_owned()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,vhost_user=true")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                vhost_user: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,iommu=on")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                iommu: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,iommu=on,queue_size=256")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                iommu: true,
+                queue_size: 256,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,iommu=on,queue_size=256,num_queues=4")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                iommu: true,
+                queue_size: 256,
+                num_queues: 4,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,direct=on")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                direct: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,wce=true")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                wce: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,wce=false")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                wce: false,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,poll_queue=false")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                poll_queue: false,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,poll_queue=true")?,
+            DiskConfig {
+                path: Some(PathBuf::from("/path/to_file")),
+                poll_queue: true,
+                ..Default::default()
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_net_parsing() -> Result<()> {
+        // mac address is random
+        assert_eq!(
+            NetConfig::parse("mac=de:ad:be:ef:12:34")?,
+            NetConfig {
+                mac: MacAddr::parse_str("de:ad:be:ef:12:34").unwrap(),
+                ..Default::default()
+            }
+        );
+
+        assert_eq!(
+            NetConfig::parse("mac=de:ad:be:ef:12:34,id=mynet0")?,
+            NetConfig {
+                mac: MacAddr::parse_str("de:ad:be:ef:12:34").unwrap(),
+                id: Some("mynet0".to_owned()),
+                ..Default::default()
+            }
+        );
+
+        assert_eq!(
+            NetConfig::parse(
+                "mac=de:ad:be:ef:12:34,tap=tap0,ip=192.168.100.1,mask=255.255.255.128"
+            )?,
+            NetConfig {
+                mac: MacAddr::parse_str("de:ad:be:ef:12:34").unwrap(),
+                tap: Some("tap0".to_owned()),
+                ip: "192.168.100.1".parse().unwrap(),
+                mask: "255.255.255.128".parse().unwrap(),
+                ..Default::default()
+            }
+        );
+
+        assert_eq!(
+            NetConfig::parse("mac=de:ad:be:ef:12:34,vhost_user=true,socket=/tmp/socket")?,
+            NetConfig {
+                mac: MacAddr::parse_str("de:ad:be:ef:12:34").unwrap(),
+                vhost_user: true,
+                vhost_socket: Some("/tmp/socket".to_owned()),
+                ..Default::default()
+            }
+        );
+
+        assert_eq!(
+            NetConfig::parse("mac=de:ad:be:ef:12:34,num_queues=4,queue_size=1024,iommu=on")?,
+            NetConfig {
+                mac: MacAddr::parse_str("de:ad:be:ef:12:34").unwrap(),
+                num_queues: 4,
+                queue_size: 1024,
+                iommu: true,
+                ..Default::default()
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_rng() -> Result<()> {
+        assert_eq!(RngConfig::parse("")?, RngConfig::default());
+        assert_eq!(
+            RngConfig::parse("src=/dev/random")?,
+            RngConfig {
+                src: PathBuf::from("/dev/random"),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            RngConfig::parse("src=/dev/random,iommu=on")?,
+            RngConfig {
+                src: PathBuf::from("/dev/random"),
+                iommu: true,
+            }
+        );
+        assert_eq!(
+            RngConfig::parse("iommu=on")?,
+            RngConfig {
+                iommu: true,
+                ..Default::default()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_fs() -> Result<()> {
+        // "tag" and "socket" must be supplied
+        assert!(FsConfig::parse("").is_err());
+        assert!(FsConfig::parse("tag=mytag").is_err());
+        assert!(FsConfig::parse("sock=/tmp/sock").is_err());
+        assert_eq!(
+            FsConfig::parse("tag=mytag,sock=/tmp/sock")?,
+            FsConfig {
+                sock: PathBuf::from("/tmp/sock"),
+                tag: "mytag".to_owned(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            FsConfig::parse("tag=mytag,sock=/tmp/sock")?,
+            FsConfig {
+                sock: PathBuf::from("/tmp/sock"),
+                tag: "mytag".to_owned(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            FsConfig::parse("tag=mytag,sock=/tmp/sock,num_queues=4,queue_size=1024")?,
+            FsConfig {
+                sock: PathBuf::from("/tmp/sock"),
+                tag: "mytag".to_owned(),
+                num_queues: 4,
+                queue_size: 1024,
+                ..Default::default()
+            }
+        );
+        // DAX on -> default cache size
+        assert_eq!(
+            FsConfig::parse("tag=mytag,sock=/tmp/sock,dax=on")?,
+            FsConfig {
+                sock: PathBuf::from("/tmp/sock"),
+                tag: "mytag".to_owned(),
+                dax: true,
+                cache_size: default_fsconfig_cache_size(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            FsConfig::parse("tag=mytag,sock=/tmp/sock,dax=on,cache_size=4G")?,
+            FsConfig {
+                sock: PathBuf::from("/tmp/sock"),
+                tag: "mytag".to_owned(),
+                dax: true,
+                cache_size: 4 << 30,
+                ..Default::default()
+            }
+        );
+        // Cache size without DAX is an error
+        assert!(FsConfig::parse("tag=mytag,sock=/tmp/sock,dax=off,cache_size=4G").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_pmem_parsing() -> Result<()> {
+        // Must always give a file and size
+        assert!(PmemConfig::parse("").is_err());
+        assert!(PmemConfig::parse("file=/tmp/pmem").is_err());
+        assert!(PmemConfig::parse("size=128M").is_err());
+        assert_eq!(
+            PmemConfig::parse("file=/tmp/pmem,size=128M")?,
+            PmemConfig {
+                file: PathBuf::from("/tmp/pmem"),
+                size: 128 << 20,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            PmemConfig::parse("file=/tmp/pmem,size=128M,id=mypmem0")?,
+            PmemConfig {
+                file: PathBuf::from("/tmp/pmem"),
+                size: 128 << 20,
+                id: Some("mypmem0".to_owned()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            PmemConfig::parse("file=/tmp/pmem,size=128M,iommu=on,mergeable=on,discard_writes=on")?,
+            PmemConfig {
+                file: PathBuf::from("/tmp/pmem"),
+                size: 128 << 20,
+                mergeable: true,
+                discard_writes: true,
+                iommu: true,
+                ..Default::default()
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_console_parsing() -> Result<()> {
+        assert!(ConsoleConfig::parse("").is_err());
+        assert!(ConsoleConfig::parse("badmode").is_err());
+        assert_eq!(
+            ConsoleConfig::parse("off")?,
+            ConsoleConfig {
+                mode: ConsoleOutputMode::Off,
+                iommu: false,
+                file: None,
+            }
+        );
+        assert_eq!(
+            ConsoleConfig::parse("tty")?,
+            ConsoleConfig {
+                mode: ConsoleOutputMode::Tty,
+                iommu: false,
+                file: None,
+            }
+        );
+        assert_eq!(
+            ConsoleConfig::parse("null")?,
+            ConsoleConfig {
+                mode: ConsoleOutputMode::Null,
+                iommu: false,
+                file: None,
+            }
+        );
+        assert_eq!(
+            ConsoleConfig::parse("file=/tmp/console")?,
+            ConsoleConfig {
+                mode: ConsoleOutputMode::File,
+                iommu: false,
+                file: Some(PathBuf::from("/tmp/console"))
+            }
+        );
+        assert_eq!(
+            ConsoleConfig::parse("null,iommu=on")?,
+            ConsoleConfig {
+                mode: ConsoleOutputMode::Null,
+                iommu: true,
+                file: None,
+            }
+        );
+        assert_eq!(
+            ConsoleConfig::parse("file=/tmp/console,iommu=on")?,
+            ConsoleConfig {
+                mode: ConsoleOutputMode::File,
+                iommu: true,
+                file: Some(PathBuf::from("/tmp/console"))
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_device_parsing() -> Result<()> {
+        // Device must have a path provided
+        assert!(DeviceConfig::parse("").is_err());
+        assert_eq!(
+            DeviceConfig::parse("path=/path/to/device")?,
+            DeviceConfig {
+                path: PathBuf::from("/path/to/device"),
+                id: None,
+                iommu: false
+            }
+        );
+
+        assert_eq!(
+            DeviceConfig::parse("path=/path/to/device,iommu=on")?,
+            DeviceConfig {
+                path: PathBuf::from("/path/to/device"),
+                id: None,
+                iommu: true
+            }
+        );
+
+        assert_eq!(
+            DeviceConfig::parse("path=/path/to/device,iommu=on,id=mydevice0")?,
+            DeviceConfig {
+                path: PathBuf::from("/path/to/device"),
+                id: Some("mydevice0".to_owned()),
+                iommu: true
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_vsock_parsing() -> Result<()> {
+        // sock and cid is required
+        assert!(VsockConfig::parse("").is_err());
+        assert_eq!(
+            VsockConfig::parse("sock=/tmp/sock,cid=1")?,
+            VsockConfig {
+                cid: 1,
+                sock: PathBuf::from("/tmp/sock"),
+                iommu: false
+            }
+        );
+        assert_eq!(
+            VsockConfig::parse("sock=/tmp/sock,cid=1,iommu=on")?,
+            VsockConfig {
+                cid: 1,
+                sock: PathBuf::from("/tmp/sock"),
+                iommu: true
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_validation() -> Result<()> {
+        let valid_config = VmConfig {
+            cpus: CpusConfig {
+                boot_vcpus: 1,
+                max_vcpus: 1,
+            },
+            memory: MemoryConfig {
+                size: 536_870_912,
+                file: None,
+                mergeable: false,
+                hotplug_method: HotplugMethod::Acpi,
+                hotplug_size: None,
+            },
+            kernel: Some(KernelConfig {
+                path: PathBuf::from("/path/to/kernel"),
+            }),
+            initramfs: None,
+            cmdline: CmdlineConfig {
+                args: String::from(""),
+            },
+            disks: None,
+            net: None,
+            rng: RngConfig {
+                src: PathBuf::from("/dev/urandom"),
+                iommu: false,
+            },
+            fs: None,
+            pmem: None,
+            serial: ConsoleConfig {
+                file: None,
+                mode: ConsoleOutputMode::Null,
+                iommu: false,
+            },
+            console: ConsoleConfig {
+                file: None,
+                mode: ConsoleOutputMode::Tty,
+                iommu: false,
+            },
+            devices: None,
+            vsock: None,
+            iommu: false,
+        };
+
+        assert!(valid_config.validate().is_ok());
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.serial.mode = ConsoleOutputMode::Tty;
+        invalid_config.console.mode = ConsoleOutputMode::Tty;
+        assert!(invalid_config.validate().is_err());
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.kernel = None;
+        assert!(invalid_config.validate().is_err());
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.serial.mode = ConsoleOutputMode::File;
+        invalid_config.serial.file = None;
+        assert!(invalid_config.validate().is_err());
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.cpus.max_vcpus = 16;
+        invalid_config.cpus.boot_vcpus = 32;
+        assert!(invalid_config.validate().is_err());
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.disks = Some(vec![DiskConfig {
+            vhost_socket: Some("/path/to/socket".to_owned()),
+            path: Some(PathBuf::from("/path/to/image")),
+            ..Default::default()
+        }]);
+        assert!(invalid_config.validate().is_err());
+
+        Ok(())
     }
 }

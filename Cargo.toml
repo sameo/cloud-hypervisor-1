@@ -1,6 +1,6 @@
 [package]
 name = "cloud-hypervisor"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["The Cloud Hypervisor Authors"]
 edition = "2018"
 default-run = "cloud-hypervisor"
@@ -10,9 +10,11 @@ build = "build.rs"
 arc-swap = ">=0.4.4"
 clap = { version = "2.33.0", features=["wrap_help"] }
 epoll = ">=4.0.1"
+futures = { version = "0.3.4", features = ["thread-pool"] }
 lazy_static = "1.4.0"
-libc = "0.2.67"
-log = { version = "0.4.10", features = ["std"] }
+libc = "0.2.69"
+log = { version = "0.4.8", features = ["std"] }
+seccomp = { git = "https://github.com/firecracker-microvm/firecracker", tag = "v0.21.1" }
 serde_json = ">=1.0.9"
 vhost_user_backend = { path = "vhost_user_backend"}
 vhost_user_block = { path = "vhost_user_block"}
@@ -21,8 +23,8 @@ vhost_user_net = { path = "vhost_user_net"}
 virtio-bindings = "0.1.0"
 vmm = { path = "vmm" }
 vm-device = { path = "vm-device" }
-vm-memory = "0.1.0"
-vmm-sys-util = "0.4.0"
+vm-memory = "0.2.0"
+vmm-sys-util = "0.5.0"
 vm-virtio = { path = "vm-virtio" }
 vhost_rs = { git = "https://github.com/cloud-hypervisor/vhost", branch = "dragonball", package = "vhost", features = ["vhost-user-slave"] }
 
@@ -32,6 +34,8 @@ dirs = "2.0.2"
 credibility = "0.1.3"
 tempdir= "0.3.7"
 lazy_static= "1.4.0"
+tempfile = "3.1.0"
+serde_json = ">=1.0.9"
 
 [features]
 default = ["acpi", "pci", "cmos"]
@@ -39,6 +43,7 @@ acpi = ["vmm/acpi"]
 pci = ["vmm/pci_support"]
 mmio = ["vmm/mmio_support"]
 cmos = ["vmm/cmos"]
+fwdebug = ["vmm/fwdebug"]
 
 # Integration tests require a special environment to run in
 integration_tests = []
@@ -52,6 +57,7 @@ members = [
     "vmm",
     "vm-virtio",
     "vm-device",
+    "vm-migration",
     "vhost_user_block",
     "vhost_user_backend",
     "vhost_user_fs",

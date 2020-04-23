@@ -1,3 +1,5 @@
+// Copyright © 2020, Oracle and/or its affiliates.
+//
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
@@ -8,25 +10,41 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
+
+use crate::config::CpusConfig;
 use crate::device_manager::DeviceManager;
+use crate::CPU_MANAGER_SNAPSHOT_ID;
 #[cfg(feature = "acpi")]
 use acpi_tables::{aml, aml::Aml, sdt::SDT};
+use anyhow::anyhow;
 #[cfg(feature = "acpi")]
 use arch::layout;
+use arch::EntryPoint;
 use devices::{ioapic, BusDevice};
-use kvm_bindings::CpuId;
+use kvm_bindings::{
+    kvm_fpu, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
+    kvm_xsave, CpuId, Msrs,
+};
 use kvm_ioctls::*;
 use libc::{c_void, siginfo_t};
+use serde_derive::{Deserialize, Serialize};
 use std::cmp;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::{fmt, io, result};
-use vm_device::{Migratable, MigratableError, Pausable, Snapshotable};
 use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
+use vm_migration::{
+    Migratable, MigratableError, Pausable, Snapshot, SnapshotDataSection, Snapshottable,
+    Transportable,
+};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::{register_signal_handler, SIGRTMIN};
+
+// CPUID feature bits
+const TSC_DEADLINE_TIMER_ECX_BIT: u8 = 24; // tsc deadline timer ecx bit.
+const HYPERVISOR_ECX_BIT: u8 = 31; // Hypervisor ecx bit.
 
 // Debug I/O port
 #[cfg(target_arch = "x86_64")]
@@ -81,6 +99,9 @@ pub enum Error {
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
 
+    /// Cannot patch the CPU ID
+    PatchCpuId(kvm_ioctls::Error),
+
     #[cfg(target_arch = "x86_64")]
     /// Error configuring the general purpose registers
     REGSConfiguration(arch::x86_64::regs::Error),
@@ -118,6 +139,60 @@ pub enum Error {
 
     /// Asking for more vCPUs that we can have
     DesiredVCPUCountExceedsMax,
+
+    /// Failed to get KVM vcpu lapic.
+    VcpuGetLapic(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu lapic.
+    VcpuSetLapic(kvm_ioctls::Error),
+
+    /// Failed to get KVM vcpu MP state.
+    VcpuGetMpState(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu MP state.
+    VcpuSetMpState(kvm_ioctls::Error),
+
+    /// Failed to get KVM vcpu msrs.
+    VcpuGetMsrs(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu msrs.
+    VcpuSetMsrs(kvm_ioctls::Error),
+
+    /// Failed to get KVM vcpu regs.
+    VcpuGetRegs(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu regs.
+    VcpuSetRegs(kvm_ioctls::Error),
+
+    /// Failed to get KVM vcpu sregs.
+    VcpuGetSregs(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu sregs.
+    VcpuSetSregs(kvm_ioctls::Error),
+
+    /// Failed to get KVM vcpu events.
+    VcpuGetVcpuEvents(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu events.
+    VcpuSetVcpuEvents(kvm_ioctls::Error),
+
+    /// Failed to get KVM vcpu FPU.
+    VcpuGetFpu(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu FPU.
+    VcpuSetFpu(kvm_ioctls::Error),
+
+    /// Failed to get KVM vcpu XSAVE.
+    VcpuGetXsave(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu XSAVE.
+    VcpuSetXsave(kvm_ioctls::Error),
+
+    /// Failed to get KVM vcpu XCRS.
+    VcpuGetXcrs(kvm_ioctls::Error),
+
+    /// Failed to set KVM vcpu XCRS.
+    VcpuSetXcrs(kvm_ioctls::Error),
 }
 pub type Result<T> = result::Result<T, Error>;
 
@@ -239,6 +314,19 @@ pub struct Vcpu {
     vm_ts: std::time::Instant,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VcpuKvmState {
+    msrs: Msrs,
+    vcpu_events: kvm_vcpu_events,
+    regs: kvm_regs,
+    sregs: kvm_sregs,
+    fpu: kvm_fpu,
+    lapic_state: kvm_lapic_state,
+    xsave: kvm_xsave,
+    xcrs: kvm_xcrs,
+    mp_state: kvm_mp_state,
+}
+
 impl Vcpu {
     /// Constructs a new VCPU for `vm`.
     ///
@@ -253,17 +341,17 @@ impl Vcpu {
         mmio_bus: Arc<devices::Bus>,
         ioapic: Option<Arc<Mutex<ioapic::Ioapic>>>,
         creation_ts: std::time::Instant,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Mutex<Self>>> {
         let kvm_vcpu = fd.create_vcpu(id).map_err(Error::VcpuFd)?;
         // Initially the cpuid per vCPU is the one supported by this VM.
-        Ok(Vcpu {
+        Ok(Arc::new(Mutex::new(Vcpu {
             fd: kvm_vcpu,
             id,
             io_bus,
             mmio_bus,
             ioapic,
             vm_ts: creation_ts,
-        })
+        })))
     }
 
     /// Configures a x86_64 specific vcpu and should be called once per vcpu from the vcpu's thread.
@@ -271,11 +359,11 @@ impl Vcpu {
     /// # Arguments
     ///
     /// * `machine_config` - Specifies necessary info used for the CPUID configuration.
-    /// * `kernel_start_addr` - Offset from `guest_mem` at which the kernel starts.
+    /// * `kernel_entry_point` - Kernel entry point address in guest memory and boot protocol used.
     /// * `vm` - The virtual machine this vcpu will get attached to.
     pub fn configure(
         &mut self,
-        kernel_start_addr: Option<GuestAddress>,
+        kernel_entry_point: Option<EntryPoint>,
         vm_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
         cpuid: CpuId,
     ) -> Result<()> {
@@ -286,18 +374,23 @@ impl Vcpu {
             .map_err(Error::SetSupportedCpusFailed)?;
 
         arch::x86_64::regs::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
-        if let Some(kernel_start_addr) = kernel_start_addr {
+        if let Some(kernel_entry_point) = kernel_entry_point {
             // Safe to unwrap because this method is called after the VM is configured
             arch::x86_64::regs::setup_regs(
                 &self.fd,
-                kernel_start_addr.raw_value(),
+                kernel_entry_point.entry_addr.raw_value(),
                 arch::x86_64::layout::BOOT_STACK_POINTER.raw_value(),
                 arch::x86_64::layout::ZERO_PAGE_START.raw_value(),
+                kernel_entry_point.protocol,
             )
             .map_err(Error::REGSConfiguration)?;
             arch::x86_64::regs::setup_fpu(&self.fd).map_err(Error::FPUConfiguration)?;
-            arch::x86_64::regs::setup_sregs(&vm_memory.memory(), &self.fd)
-                .map_err(Error::SREGSConfiguration)?;
+            arch::x86_64::regs::setup_sregs(
+                &vm_memory.memory(),
+                &self.fd,
+                kernel_entry_point.protocol,
+            )
+            .map_err(Error::SREGSConfiguration)?;
         }
         arch::x86_64::interrupts::set_lint(&self.fd).map_err(Error::LocalIntConfiguration)?;
         Ok(())
@@ -367,6 +460,113 @@ impl Vcpu {
             ts.as_micros()
         );
     }
+
+    fn kvm_state(&self) -> Result<VcpuKvmState> {
+        let mut msrs = arch::x86_64::regs::boot_msr_entries();
+        self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
+
+        let vcpu_events = self
+            .fd
+            .get_vcpu_events()
+            .map_err(Error::VcpuGetVcpuEvents)?;
+        let regs = self.fd.get_regs().map_err(Error::VcpuGetRegs)?;
+        let sregs = self.fd.get_sregs().map_err(Error::VcpuGetSregs)?;
+        let lapic_state = self.fd.get_lapic().map_err(Error::VcpuGetLapic)?;
+        let fpu = self.fd.get_fpu().map_err(Error::VcpuGetFpu)?;
+        let xsave = self.fd.get_xsave().map_err(Error::VcpuGetXsave)?;
+        let xcrs = self.fd.get_xcrs().map_err(Error::VcpuGetXsave)?;
+        let mp_state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
+
+        Ok(VcpuKvmState {
+            msrs,
+            vcpu_events,
+            regs,
+            sregs,
+            fpu,
+            lapic_state,
+            xsave,
+            xcrs,
+            mp_state,
+        })
+    }
+
+    fn set_kvm_state(&mut self, state: &VcpuKvmState) -> Result<()> {
+        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
+
+        self.fd.set_fpu(&state.fpu).map_err(Error::VcpuSetFpu)?;
+
+        self.fd
+            .set_xsave(&state.xsave)
+            .map_err(Error::VcpuSetXsave)?;
+
+        self.fd
+            .set_sregs(&state.sregs)
+            .map_err(Error::VcpuSetSregs)?;
+
+        self.fd.set_xcrs(&state.xcrs).map_err(Error::VcpuSetXcrs)?;
+
+        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+
+        self.fd
+            .set_lapic(&state.lapic_state)
+            .map_err(Error::VcpuSetLapic)?;
+
+        self.fd
+            .set_mp_state(state.mp_state)
+            .map_err(Error::VcpuSetMpState)?;
+
+        Ok(())
+    }
+}
+
+const VCPU_SNAPSHOT_ID: &str = "vcpu";
+impl Pausable for Vcpu {}
+impl Snapshottable for Vcpu {
+    fn id(&self) -> String {
+        VCPU_SNAPSHOT_ID.to_string()
+    }
+
+    fn snapshot(&self) -> std::result::Result<Snapshot, MigratableError> {
+        let snapshot = serde_json::to_vec(&self.kvm_state().map_err(|e| {
+            MigratableError::Snapshot(anyhow!("Could not get vCPU KVM state {:?}", e))
+        })?)
+        .map_err(|e| MigratableError::Snapshot(e.into()))?;
+
+        let mut vcpu_snapshot = Snapshot::new(&format!("{}", self.id));
+        vcpu_snapshot.add_data_section(SnapshotDataSection {
+            id: format!("{}-section", VCPU_SNAPSHOT_ID),
+            snapshot,
+        });
+
+        Ok(vcpu_snapshot)
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
+        if let Some(vcpu_section) = snapshot
+            .snapshot_data
+            .get(&format!("{}-section", VCPU_SNAPSHOT_ID))
+        {
+            let vcpu_state = match serde_json::from_slice(&vcpu_section.snapshot) {
+                Ok(state) => state,
+                Err(error) => {
+                    return Err(MigratableError::Restore(anyhow!(
+                        "Could not deserialize the vCPU snapshot {}",
+                        error
+                    )))
+                }
+            };
+
+            self.set_kvm_state(&vcpu_state).map_err(|e| {
+                MigratableError::Restore(anyhow!("Could not set the vCPU KVM state {:?}", e))
+            })?;
+
+            Ok(())
+        } else {
+            Err(MigratableError::Restore(anyhow!(
+                "Could not find the vCPU snapshot section"
+            )))
+        }
+    }
 }
 
 pub struct CpuManager {
@@ -383,6 +583,7 @@ pub struct CpuManager {
     reset_evt: EventFd,
     vcpu_states: Vec<VcpuState>,
     selected_cpu: u8,
+    vcpus: Vec<Arc<Mutex<Vcpu>>>,
 }
 
 const CPU_ENABLE_FLAG: usize = 0;
@@ -492,21 +693,21 @@ impl VcpuState {
 
 impl CpuManager {
     pub fn new(
-        boot_vcpus: u8,
-        max_vcpus: u8,
+        config: &CpusConfig,
         device_manager: &Arc<Mutex<DeviceManager>>,
         guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+        kvm: &Kvm,
         fd: Arc<VmFd>,
-        cpuid: CpuId,
         reset_evt: EventFd,
     ) -> Result<Arc<Mutex<CpuManager>>> {
-        let mut vcpu_states = Vec::with_capacity(usize::from(max_vcpus));
-        vcpu_states.resize_with(usize::from(max_vcpus), VcpuState::default);
+        let mut vcpu_states = Vec::with_capacity(usize::from(config.max_vcpus));
+        vcpu_states.resize_with(usize::from(config.max_vcpus), VcpuState::default);
 
         let device_manager = device_manager.lock().unwrap();
+        let cpuid = CpuManager::patch_cpuid(kvm)?;
         let cpu_manager = Arc::new(Mutex::new(CpuManager {
-            boot_vcpus,
-            max_vcpus,
+            boot_vcpus: config.boot_vcpus,
+            max_vcpus: config.max_vcpus,
             io_bus: device_manager.io_bus().clone(),
             mmio_bus: device_manager.mmio_bus().clone(),
             ioapic: device_manager.ioapic().clone(),
@@ -518,6 +719,7 @@ impl CpuManager {
             vcpu_states,
             reset_evt,
             selected_cpu: 0,
+            vcpus: Vec::with_capacity(usize::from(config.max_vcpus)),
         }));
 
         device_manager
@@ -537,11 +739,154 @@ impl CpuManager {
         Ok(cpu_manager)
     }
 
-    fn activate_vcpus(
+    fn patch_cpuid(kvm: &Kvm) -> Result<CpuId> {
+        let mut cpuid_patches = Vec::new();
+
+        // Patch tsc deadline timer bit
+        cpuid_patches.push(CpuidPatch {
+            function: 1,
+            index: 0,
+            flags_bit: None,
+            eax_bit: None,
+            ebx_bit: None,
+            ecx_bit: Some(TSC_DEADLINE_TIMER_ECX_BIT),
+            edx_bit: None,
+        });
+
+        // Patch hypervisor bit
+        cpuid_patches.push(CpuidPatch {
+            function: 1,
+            index: 0,
+            flags_bit: None,
+            eax_bit: None,
+            ebx_bit: None,
+            ecx_bit: Some(HYPERVISOR_ECX_BIT),
+            edx_bit: None,
+        });
+
+        // Supported CPUID
+        let mut cpuid = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map_err(Error::PatchCpuId)?;
+
+        CpuidPatch::patch_cpuid(&mut cpuid, cpuid_patches);
+
+        Ok(cpuid)
+    }
+
+    fn start_vcpu(
         &mut self,
-        desired_vcpus: u8,
-        entry_addr: Option<GuestAddress>,
+        cpu_id: u8,
+        creation_ts: std::time::Instant,
+        vcpu_thread_barrier: Arc<Barrier>,
+        entry_point: Option<EntryPoint>,
+        inserting: bool,
+        snapshot: Option<Snapshot>,
     ) -> Result<()> {
+        let ioapic = if let Some(ioapic) = &self.ioapic {
+            Some(ioapic.clone())
+        } else {
+            None
+        };
+
+        let vcpu = Vcpu::new(
+            cpu_id,
+            &self.fd,
+            self.io_bus.clone(),
+            self.mmio_bus.clone(),
+            ioapic,
+            creation_ts,
+        )?;
+
+        let reset_evt = self.reset_evt.try_clone().unwrap();
+        let vcpu_kill_signalled = self.vcpus_kill_signalled.clone();
+        let vcpu_pause_signalled = self.vcpus_pause_signalled.clone();
+
+        let vcpu_kill = self.vcpu_states[usize::from(cpu_id)].kill.clone();
+
+        if let Some(snapshot) = snapshot {
+            let mut cpuid = self.cpuid.clone();
+            CpuidPatch::set_cpuid_reg(&mut cpuid, 0xb, None, CpuidReg::EDX, u32::from(cpu_id));
+
+            vcpu.lock()
+                .unwrap()
+                .fd
+                .set_cpuid2(&cpuid)
+                .map_err(Error::SetSupportedCpusFailed)?;
+
+            vcpu.lock()
+                .unwrap()
+                .restore(snapshot)
+                .expect("Failed to restore vCPU");
+        } else {
+            let vm_memory = self.vm_memory.clone();
+
+            vcpu.lock()
+                .unwrap()
+                .configure(entry_point, &vm_memory, self.cpuid.clone())
+                .expect("Failed to configure vCPU");
+        }
+
+        let vcpu_clone = Arc::clone(&vcpu);
+        self.vcpus.push(vcpu_clone);
+
+        let handle = Some(
+            thread::Builder::new()
+                .name(format!("vcpu{}", cpu_id))
+                .spawn(move || {
+                    extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
+                    // This uses an async signal safe handler to kill the vcpu handles.
+                    register_signal_handler(SIGRTMIN(), handle_signal)
+                        .expect("Failed to register vcpu signal handler");
+
+                    // Block until all CPUs are ready.
+                    vcpu_thread_barrier.wait();
+
+                    loop {
+                        // vcpu.run() returns false on a KVM_EXIT_SHUTDOWN (triple-fault) so trigger a reset
+                        match vcpu.lock().unwrap().run() {
+                            Err(e) => {
+                                error!("VCPU generated error: {:?}", e);
+                                break;
+                            }
+                            Ok(true) => {}
+                            Ok(false) => {
+                                reset_evt.write(1).unwrap();
+                                break;
+                            }
+                        }
+
+                        // We've been told to terminate
+                        if vcpu_kill_signalled.load(Ordering::SeqCst)
+                            || vcpu_kill.load(Ordering::SeqCst)
+                        {
+                            break;
+                        }
+
+                        // If we are being told to pause, we park the thread
+                        // until the pause boolean is toggled.
+                        // The resume operation is responsible for toggling
+                        // the boolean and unpark the thread.
+                        // We enter a loop because park() could spuriously
+                        // return. We will then park() again unless the
+                        // pause boolean has been toggled.
+                        while vcpu_pause_signalled.load(Ordering::SeqCst) {
+                            thread::park();
+                        }
+                    }
+                })
+                .map_err(Error::VcpuSpawn)?,
+        );
+
+        // On hot plug calls into this function entry_point is None. It is for
+        // those hotplug CPU additions that we need to set the inserting flag.
+        self.vcpu_states[usize::from(cpu_id)].handle = handle;
+        self.vcpu_states[usize::from(cpu_id)].inserting = inserting;
+
+        Ok(())
+    }
+
+    fn activate_vcpus(&mut self, desired_vcpus: u8, entry_point: Option<EntryPoint>) -> Result<()> {
         if desired_vcpus > self.max_vcpus {
             return Err(Error::DesiredVCPUCountExceedsMax);
         }
@@ -552,86 +897,14 @@ impl CpuManager {
         ));
 
         for cpu_id in self.present_vcpus()..desired_vcpus {
-            let ioapic = if let Some(ioapic) = &self.ioapic {
-                Some(ioapic.clone())
-            } else {
-                None
-            };
-
-            let mut vcpu = Vcpu::new(
+            self.start_vcpu(
                 cpu_id,
-                &self.fd,
-                self.io_bus.clone(),
-                self.mmio_bus.clone(),
-                ioapic,
                 creation_ts,
+                vcpu_thread_barrier.clone(),
+                entry_point,
+                entry_point.is_none(),
+                None,
             )?;
-
-            let vcpu_thread_barrier = vcpu_thread_barrier.clone();
-
-            let reset_evt = self.reset_evt.try_clone().unwrap();
-            let vcpu_kill_signalled = self.vcpus_kill_signalled.clone();
-            let vcpu_pause_signalled = self.vcpus_pause_signalled.clone();
-
-            let vcpu_kill = self.vcpu_states[usize::from(cpu_id)].kill.clone();
-            let vm_memory = self.vm_memory.clone();
-            let cpuid = self.cpuid.clone();
-
-            let handle = Some(
-                thread::Builder::new()
-                    .name(format!("vcpu{}", vcpu.id))
-                    .spawn(move || {
-                        extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
-                        // This uses an async signal safe handler to kill the vcpu handles.
-                        register_signal_handler(SIGRTMIN(), handle_signal)
-                            .expect("Failed to register vcpu signal handler");
-
-                        vcpu.configure(entry_addr, &vm_memory, cpuid)
-                            .expect("Failed to configure vCPU");
-
-                        // Block until all CPUs are ready.
-                        vcpu_thread_barrier.wait();
-
-                        loop {
-                            // vcpu.run() returns false on a KVM_EXIT_SHUTDOWN (triple-fault) so trigger a reset
-                            match vcpu.run() {
-                                Err(e) => {
-                                    error!("VCPU generated error: {:?}", e);
-                                    break;
-                                }
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    reset_evt.write(1).unwrap();
-                                    break;
-                                }
-                            }
-
-                            // We've been told to terminate
-                            if vcpu_kill_signalled.load(Ordering::SeqCst)
-                                || vcpu_kill.load(Ordering::SeqCst)
-                            {
-                                break;
-                            }
-
-                            // If we are being told to pause, we park the thread
-                            // until the pause boolean is toggled.
-                            // The resume operation is responsible for toggling
-                            // the boolean and unpark the thread.
-                            // We enter a loop because park() could spuriously
-                            // return. We will then park() again unless the
-                            // pause boolean has been toggled.
-                            while vcpu_pause_signalled.load(Ordering::SeqCst) {
-                                thread::park();
-                            }
-                        }
-                    })
-                    .map_err(Error::VcpuSpawn)?,
-            );
-
-            // On hot plug calls into this function entry_addr is None. It is for
-            // those hotplug CPU additions that we need to set the inserting flag.
-            self.vcpu_states[usize::from(cpu_id)].handle = handle;
-            self.vcpu_states[usize::from(cpu_id)].inserting = entry_addr.is_none();
         }
 
         // Unblock all CPU threads.
@@ -657,8 +930,8 @@ impl CpuManager {
     }
 
     // Starts all the vCPUs that the VM is booting with. Blocks until all vCPUs are running.
-    pub fn start_boot_vcpus(&mut self, entry_addr: GuestAddress) -> Result<()> {
-        self.activate_vcpus(self.boot_vcpus(), Some(entry_addr))
+    pub fn start_boot_vcpus(&mut self, entry_point: EntryPoint) -> Result<()> {
+        self.activate_vcpus(self.boot_vcpus(), Some(entry_point))
     }
 
     pub fn resize(&mut self, desired_vcpus: u8) -> Result<bool> {
@@ -1064,5 +1337,45 @@ impl Pausable for CpuManager {
     }
 }
 
-impl Snapshotable for CpuManager {}
+impl Snapshottable for CpuManager {
+    fn id(&self) -> String {
+        CPU_MANAGER_SNAPSHOT_ID.to_string()
+    }
+
+    fn snapshot(&self) -> std::result::Result<Snapshot, MigratableError> {
+        let mut cpu_manager_snapshot = Snapshot::new(CPU_MANAGER_SNAPSHOT_ID);
+
+        // The CpuManager snapshot is a collection of all vCPUs snapshots.
+        for vcpu in &self.vcpus {
+            let cpu_snapshot = vcpu.lock().unwrap().snapshot()?;
+            cpu_manager_snapshot.add_snapshot(cpu_snapshot);
+        }
+
+        Ok(cpu_manager_snapshot)
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
+        let creation_ts = std::time::Instant::now();
+        let vcpu_thread_barrier = Arc::new(Barrier::new((snapshot.snapshots.len() + 1) as usize));
+
+        for (cpu_id, snapshot) in snapshot.snapshots.iter() {
+            debug!("Restoring VCPU {}", cpu_id);
+            self.start_vcpu(
+                cpu_id.parse::<u8>().unwrap(),
+                creation_ts,
+                vcpu_thread_barrier.clone(),
+                None,
+                false,
+                Some(*snapshot.clone()),
+            )
+            .map_err(|e| MigratableError::Restore(anyhow!("Could not restore vCPU {:?}", e)))?;
+        }
+
+        // Unblock all restored CPU threads.
+        vcpu_thread_barrier.wait();
+        Ok(())
+    }
+}
+
+impl Transportable for CpuManager {}
 impl Migratable for CpuManager {}

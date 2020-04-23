@@ -1,3 +1,5 @@
+// Copyright © 2020, Oracle and/or its affiliates.
+//
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -8,10 +10,11 @@
 use std::{mem, result};
 
 use super::gdt::{gdt_entry, kvm_segment_from_gdt};
+use super::BootProtocol;
 use arch_gen::x86::msr_index;
 use kvm_bindings::{kvm_fpu, kvm_msr_entry, kvm_regs, kvm_sregs, Msrs};
 use kvm_ioctls::VcpuFd;
-use layout::{BOOT_GDT_START, BOOT_IDT_START, PDE_START, PDPTE_START, PML4_START};
+use layout::{BOOT_GDT_START, BOOT_IDT_START, PDE_START, PDPTE_START, PML4_START, PVH_INFO_START};
 use vm_memory::{Address, Bytes, GuestMemory, GuestMemoryError, GuestMemoryMmap};
 
 // MTRR constants
@@ -67,7 +70,7 @@ pub fn setup_fpu(vcpu: &VcpuFd) -> Result<()> {
 ///
 /// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
 pub fn setup_msrs(vcpu: &VcpuFd) -> Result<()> {
-    vcpu.set_msrs(&create_msr_entries())
+    vcpu.set_msrs(&boot_msr_entries())
         .map_err(Error::SetModelSpecificRegisters)?;
 
     Ok(())
@@ -81,16 +84,31 @@ pub fn setup_msrs(vcpu: &VcpuFd) -> Result<()> {
 /// * `boot_ip` - Starting instruction pointer.
 /// * `boot_sp` - Starting stack pointer.
 /// * `boot_si` - Must point to zero page address per Linux ABI.
-pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64, boot_sp: u64, boot_si: u64) -> Result<()> {
-    let regs: kvm_regs = kvm_regs {
-        rflags: 0x0000000000000002u64,
-        rip: boot_ip,
-        rsp: boot_sp,
-        rbp: boot_sp,
-        rsi: boot_si,
-        ..Default::default()
+pub fn setup_regs(
+    vcpu: &VcpuFd,
+    boot_ip: u64,
+    boot_sp: u64,
+    boot_si: u64,
+    boot_prot: BootProtocol,
+) -> Result<()> {
+    let regs: kvm_regs = match boot_prot {
+        // Configure regs as required by PVH boot protocol.
+        BootProtocol::PvhBoot => kvm_regs {
+            rflags: 0x0000000000000002u64,
+            rbx: PVH_INFO_START.raw_value(),
+            rip: boot_ip,
+            ..Default::default()
+        },
+        // Configure regs as required by Linux 64-bit boot protocol.
+        BootProtocol::LinuxBoot => kvm_regs {
+            rflags: 0x0000000000000002u64,
+            rip: boot_ip,
+            rsp: boot_sp,
+            rbp: boot_sp,
+            rsi: boot_si,
+            ..Default::default()
+        },
     };
-
     vcpu.set_regs(&regs).map_err(Error::SetBaseRegisters)
 }
 
@@ -100,11 +118,14 @@ pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64, boot_sp: u64, boot_si: u64) -> Re
 ///
 /// * `mem` - The memory that will be passed to the guest.
 /// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &VcpuFd) -> Result<()> {
+pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &VcpuFd, boot_prot: BootProtocol) -> Result<()> {
     let mut sregs: kvm_sregs = vcpu.get_sregs().map_err(Error::GetStatusRegisters)?;
 
-    configure_segments_and_sregs(mem, &mut sregs)?;
-    setup_page_tables(mem, &mut sregs)?; // TODO(dgreid) - Can this be done once per system instead?
+    configure_segments_and_sregs(mem, &mut sregs, boot_prot)?;
+
+    if let BootProtocol::LinuxBoot = boot_prot {
+        setup_page_tables(mem, &mut sregs)?; // TODO(dgreid) - Can this be done once per system instead?
+    }
 
     vcpu.set_sregs(&sregs).map_err(Error::SetStatusRegisters)
 }
@@ -136,13 +157,31 @@ fn write_idt_value(val: u64, guest_mem: &GuestMemoryMmap) -> Result<()> {
         .map_err(Error::WriteIDT)
 }
 
-fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()> {
-    let gdt_table: [u64; BOOT_GDT_MAX as usize] = [
-        gdt_entry(0, 0, 0),            // NULL
-        gdt_entry(0xa09b, 0, 0xfffff), // CODE
-        gdt_entry(0xc093, 0, 0xfffff), // DATA
-        gdt_entry(0x808b, 0, 0xfffff), // TSS
-    ];
+fn configure_segments_and_sregs(
+    mem: &GuestMemoryMmap,
+    sregs: &mut kvm_sregs,
+    boot_prot: BootProtocol,
+) -> Result<()> {
+    let gdt_table: [u64; BOOT_GDT_MAX as usize] = match boot_prot {
+        BootProtocol::PvhBoot => {
+            // Configure GDT entries as specified by PVH boot protocol
+            [
+                gdt_entry(0, 0, 0),               // NULL
+                gdt_entry(0xc09b, 0, 0xffffffff), // CODE
+                gdt_entry(0xc093, 0, 0xffffffff), // DATA
+                gdt_entry(0x008b, 0, 0x67),       // TSS
+            ]
+        }
+        BootProtocol::LinuxBoot => {
+            // Configure GDT entries as specified by Linux 64bit boot protocol
+            [
+                gdt_entry(0, 0, 0),            // NULL
+                gdt_entry(0xa09b, 0, 0xfffff), // CODE
+                gdt_entry(0xc093, 0, 0xfffff), // DATA
+                gdt_entry(0x808b, 0, 0xfffff), // TSS
+            ]
+        }
+    };
 
     let code_seg = kvm_segment_from_gdt(gdt_table[1], 1);
     let data_seg = kvm_segment_from_gdt(gdt_table[2], 2);
@@ -165,9 +204,17 @@ fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) ->
     sregs.ss = data_seg;
     sregs.tr = tss_seg;
 
-    /* 64-bit protected mode */
-    sregs.cr0 |= X86_CR0_PE;
-    sregs.efer |= EFER_LME | EFER_LMA;
+    match boot_prot {
+        BootProtocol::PvhBoot => {
+            sregs.cr0 = X86_CR0_PE;
+            sregs.cr4 = 0;
+        }
+        BootProtocol::LinuxBoot => {
+            /* 64-bit protected mode */
+            sregs.cr0 |= X86_CR0_PE;
+            sregs.efer |= EFER_LME | EFER_LMA;
+        }
+    }
 
     Ok(())
 }
@@ -195,68 +242,43 @@ fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()>
     Ok(())
 }
 
-fn create_msr_entries() -> Msrs {
-    let mut entries = Vec::<kvm_msr_entry>::new();
+macro_rules! kvm_msr {
+    ($msr:expr) => {
+        kvm_msr_entry {
+            index: $msr,
+            data: 0x0,
+            ..Default::default()
+        }
+    };
+}
 
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_IA32_SYSENTER_CS,
-        data: 0x0,
-        ..Default::default()
-    });
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_IA32_SYSENTER_ESP,
-        data: 0x0,
-        ..Default::default()
-    });
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_IA32_SYSENTER_EIP,
-        data: 0x0,
-        ..Default::default()
-    });
-    // x86_64 specific msrs, we only run on x86_64 not x86.
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_STAR,
-        data: 0x0,
-        ..Default::default()
-    });
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_CSTAR,
-        data: 0x0,
-        ..Default::default()
-    });
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_KERNEL_GS_BASE,
-        data: 0x0,
-        ..Default::default()
-    });
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_SYSCALL_MASK,
-        data: 0x0,
-        ..Default::default()
-    });
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_LSTAR,
-        data: 0x0,
-        ..Default::default()
-    });
-    // end of x86_64 specific code
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_IA32_TSC,
-        data: 0x0,
-        ..Default::default()
-    });
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_IA32_MISC_ENABLE,
-        data: msr_index::MSR_IA32_MISC_ENABLE_FAST_STRING as u64,
-        ..Default::default()
-    });
-    entries.push(kvm_msr_entry {
-        index: msr_index::MSR_MTRRdefType,
-        data: MTRR_ENABLE | MTRR_MEM_TYPE_WB,
-        ..Default::default()
-    });
+macro_rules! kvm_msr_data {
+    ($msr:expr, $data:expr) => {
+        kvm_msr_entry {
+            index: $msr,
+            data: $data,
+            ..Default::default()
+        }
+    };
+}
 
-    Msrs::from_entries(&entries)
+pub fn boot_msr_entries() -> Msrs {
+    Msrs::from_entries(&[
+        kvm_msr!(msr_index::MSR_IA32_SYSENTER_CS),
+        kvm_msr!(msr_index::MSR_IA32_SYSENTER_ESP),
+        kvm_msr!(msr_index::MSR_IA32_SYSENTER_EIP),
+        kvm_msr!(msr_index::MSR_STAR),
+        kvm_msr!(msr_index::MSR_CSTAR),
+        kvm_msr!(msr_index::MSR_LSTAR),
+        kvm_msr!(msr_index::MSR_KERNEL_GS_BASE),
+        kvm_msr!(msr_index::MSR_SYSCALL_MASK),
+        kvm_msr!(msr_index::MSR_IA32_TSC),
+        kvm_msr_data!(
+            msr_index::MSR_IA32_MISC_ENABLE,
+            msr_index::MSR_IA32_MISC_ENABLE_FAST_STRING as u64
+        ),
+        kvm_msr_data!(msr_index::MSR_MTRRdefType, MTRR_ENABLE | MTRR_MEM_TYPE_WB),
+    ])
 }
 
 #[cfg(test)]
@@ -280,7 +302,7 @@ mod tests {
     fn segments_and_sregs() {
         let mut sregs: kvm_sregs = Default::default();
         let gm = create_guest_mem();
-        configure_segments_and_sregs(&gm, &mut sregs).unwrap();
+        configure_segments_and_sregs(&gm, &mut sregs, BootProtocol::LinuxBoot).unwrap();
 
         assert_eq!(0x0, read_u64(&gm, BOOT_GDT_START));
         assert_eq!(
@@ -298,16 +320,46 @@ mod tests {
         assert_eq!(0x0, read_u64(&gm, BOOT_IDT_START));
 
         assert_eq!(0, sregs.cs.base);
-        assert_eq!(0xfffff, sregs.ds.limit);
+        assert_eq!(0xffffffff, sregs.ds.limit);
         assert_eq!(0x10, sregs.es.selector);
         assert_eq!(1, sregs.fs.present);
         assert_eq!(1, sregs.gs.g);
         assert_eq!(0, sregs.ss.avl);
         assert_eq!(0, sregs.tr.base);
-        assert_eq!(0xfffff, sregs.tr.limit);
+        assert_eq!(0xffffffff, sregs.tr.limit);
         assert_eq!(0, sregs.tr.avl);
         assert_eq!(X86_CR0_PE, sregs.cr0);
         assert_eq!(EFER_LME | EFER_LMA, sregs.efer);
+
+        configure_segments_and_sregs(&gm, &mut sregs, BootProtocol::PvhBoot).unwrap();
+        assert_eq!(0x0, read_u64(&gm, BOOT_GDT_START));
+        assert_eq!(
+            0xcf9b000000ffff,
+            read_u64(&gm, BOOT_GDT_START.unchecked_add(8))
+        );
+        assert_eq!(
+            0xcf93000000ffff,
+            read_u64(&gm, BOOT_GDT_START.unchecked_add(16))
+        );
+        assert_eq!(
+            0x8b0000000067,
+            read_u64(&gm, BOOT_GDT_START.unchecked_add(24))
+        );
+        assert_eq!(0x0, read_u64(&gm, BOOT_IDT_START));
+
+        assert_eq!(0, sregs.cs.base);
+        assert_eq!(0xffffffff, sregs.ds.limit);
+        assert_eq!(0x10, sregs.es.selector);
+        assert_eq!(1, sregs.fs.present);
+        assert_eq!(1, sregs.gs.g);
+        assert_eq!(0, sregs.ss.avl);
+        assert_eq!(0, sregs.tr.base);
+        assert_eq!(0, sregs.tr.g);
+        assert_eq!(0x67, sregs.tr.limit);
+        assert_eq!(0xb, sregs.tr.type_);
+        assert_eq!(0, sregs.tr.avl);
+        assert_eq!(X86_CR0_PE, sregs.cr0);
+        assert_eq!(0, sregs.cr4);
     }
 
     #[test]
@@ -374,7 +426,7 @@ mod tests {
         // Official entries that were setup when we did setup_msrs. We need to assert that the
         // tenth one (i.e the one with index msr_index::MSR_IA32_MISC_ENABLE has the data we
         // expect.
-        let entry_vec = create_msr_entries();
+        let entry_vec = boot_msr_entries();
         assert_eq!(entry_vec.as_slice()[9], msrs.as_slice()[0]);
     }
 
@@ -398,6 +450,7 @@ mod tests {
             expected_regs.rip,
             expected_regs.rsp,
             expected_regs.rsi,
+            BootProtocol::LinuxBoot,
         )
         .unwrap();
 
@@ -413,10 +466,10 @@ mod tests {
 
         let mut expected_sregs: kvm_sregs = vcpu.get_sregs().unwrap();
         let gm = create_guest_mem();
-        configure_segments_and_sregs(&gm, &mut expected_sregs).unwrap();
+        configure_segments_and_sregs(&gm, &mut expected_sregs, BootProtocol::LinuxBoot).unwrap();
         setup_page_tables(&gm, &mut expected_sregs).unwrap();
 
-        setup_sregs(&gm, &vcpu).unwrap();
+        setup_sregs(&gm, &vcpu, BootProtocol::LinuxBoot).unwrap();
         let actual_sregs: kvm_sregs = vcpu.get_sregs().unwrap();
         assert_eq!(expected_sregs, actual_sregs);
     }

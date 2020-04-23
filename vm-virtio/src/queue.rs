@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use crate::device::VirtioIommuRemapping;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestUsize,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
+    GuestUsize,
 };
 
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = 0x1;
@@ -29,6 +30,8 @@ pub enum Error {
     GuestMemoryError,
     InvalidIndirectDescriptor,
     InvalidChain,
+    InvalidOffset(u64),
+    InvalidRingIndexFromMemory(GuestMemoryError),
 }
 
 impl Display for Error {
@@ -39,6 +42,8 @@ impl Display for Error {
             GuestMemoryError => write!(f, "error accessing guest memory"),
             InvalidChain => write!(f, "invalid descriptor chain"),
             InvalidIndirectDescriptor => write!(f, "invalid indirect descriptor"),
+            InvalidOffset(o) => write!(f, "invalid offset {}", o),
+            InvalidRingIndexFromMemory(e) => write!(f, "invalid ring index from memory: {}", e),
         }
     }
 }
@@ -93,6 +98,14 @@ pub struct Descriptor {
 }
 
 unsafe impl ByteValued for Descriptor {}
+
+/// A virtio descriptor head, not tied to a GuestMemoryMmap.
+pub struct DescriptorHead {
+    desc_table: GuestAddress,
+    table_size: u16,
+    index: u16,
+    iommu_mapping_cb: Option<Arc<VirtioIommuRemapping>>,
+}
 
 /// A virtio descriptor chain.
 #[derive(Clone)]
@@ -224,6 +237,34 @@ impl<'a> DescriptorChain<'a> {
         Ok(chain)
     }
 
+    /// Returns a copy of a descriptor referencing a different GuestMemoryMmap object.
+    pub fn new_from_head(
+        mem: &'a GuestMemoryMmap,
+        head: DescriptorHead,
+    ) -> Result<DescriptorChain<'a>, Error> {
+        match DescriptorChain::checked_new(
+            mem,
+            head.desc_table,
+            head.table_size,
+            head.index,
+            head.iommu_mapping_cb,
+        ) {
+            Some(d) => Ok(d),
+            None => Err(Error::InvalidChain),
+        }
+    }
+
+    /// Returns a DescriptorHead that can be used to build a copy of a descriptor
+    /// referencing a different GuestMemoryMmap.
+    pub fn get_head(&self) -> DescriptorHead {
+        DescriptorHead {
+            desc_table: self.desc_table,
+            table_size: self.table_size,
+            index: self.index,
+            iommu_mapping_cb: self.iommu_mapping_cb.clone(),
+        }
+    }
+
     fn is_valid(&self) -> bool {
         !(self
             .mem
@@ -347,11 +388,15 @@ impl<'a, 'b> Iterator for AvailIter<'a, 'b> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "GuestAddress")]
+struct GuestAddressDef(pub u64);
+
+#[derive(Clone, Serialize, Deserialize)]
 /// A virtio queue's parameters.
 pub struct Queue {
     /// The maximal size in elements offered by the device
-    max_size: u16,
+    pub max_size: u16,
 
     /// The queue size in elements the driver selected
     pub size: u16,
@@ -362,18 +407,22 @@ pub struct Queue {
     /// Interrupt vector index of the queue
     pub vector: u16,
 
+    #[serde(with = "GuestAddressDef")]
     /// Guest physical address of the descriptor table
     pub desc_table: GuestAddress,
 
+    #[serde(with = "GuestAddressDef")]
     /// Guest physical address of the available ring
     pub avail_ring: GuestAddress,
 
+    #[serde(with = "GuestAddressDef")]
     /// Guest physical address of the used ring
     pub used_ring: GuestAddress,
 
     pub next_avail: Wrapping<u16>,
     pub next_used: Wrapping<u16>,
 
+    #[serde(skip)]
     pub iommu_mapping_cb: Option<Arc<VirtioIommuRemapping>>,
 }
 
@@ -561,7 +610,7 @@ impl Queue {
             };
 
         // This fence ensures we're seeing the latest update from the guest.
-        fence(Ordering::Acquire);
+        fence(Ordering::SeqCst);
         match mem.read_obj::<u16>(used_event_addr) {
             Ok(ret) => Some(Wrapping(ret)),
             Err(_) => None,
@@ -603,6 +652,29 @@ impl Queue {
     /// of an iterator increment on the queue.
     pub fn go_to_previous_position(&mut self) {
         self.next_avail -= Wrapping(1);
+    }
+
+    /// Get ring's index from memory.
+    fn index_from_memory(&self, ring: GuestAddress, mem: &GuestMemoryMmap) -> Result<u16, Error> {
+        mem.read_obj::<u16>(
+            mem.checked_offset(ring, 2)
+                .ok_or_else(|| Error::InvalidOffset(ring.raw_value() + 2))?,
+        )
+        .map_err(Error::InvalidRingIndexFromMemory)
+    }
+
+    /// Get latest index from available ring.
+    pub fn avail_index_from_memory(&self, mem: &GuestMemoryMmap) -> Result<u16, Error> {
+        self.index_from_memory(self.avail_ring, mem)
+    }
+
+    /// Get latest index from used ring.
+    pub fn used_index_from_memory(&self, mem: &GuestMemoryMmap) -> Result<u16, Error> {
+        self.index_from_memory(self.used_ring, mem)
+    }
+
+    pub fn available_descriptors(&self, mem: &GuestMemoryMmap) -> Result<bool, Error> {
+        Ok(self.used_index_from_memory(mem)? < self.avail_index_from_memory(mem)?)
     }
 }
 

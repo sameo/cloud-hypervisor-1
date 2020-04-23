@@ -1,66 +1,85 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::vu_common_ctrl::{reset_vhost_user, setup_vhost_user};
+use super::vu_common_ctrl::{reset_vhost_user, setup_vhost_user, update_mem_table};
 use super::Error as DeviceError;
 use super::{Error, Result};
 use crate::vhost_user::handler::{VhostUserEpollConfig, VhostUserEpollHandler};
 use crate::{
-    ActivateError, ActivateResult, Queue, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
-    VirtioSharedMemoryList, VIRTIO_F_VERSION_1,
+    ActivateError, ActivateResult, Queue, UserspaceMapping, VirtioDevice, VirtioDeviceType,
+    VirtioInterrupt, VirtioSharedMemoryList, VIRTIO_F_VERSION_1,
 };
-use libc::{self, EFD_NONBLOCK};
+use libc::{self, c_void, off64_t, pread64, pwrite64, EFD_NONBLOCK};
 use std::cmp;
 use std::io;
 use std::io::Write;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use vhost_rs::vhost_user::message::{
-    VhostUserFSSlaveMsg, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
-    VHOST_USER_FS_SLAVE_ENTRIES,
+    VhostUserFSSlaveMsg, VhostUserFSSlaveMsgFlags, VhostUserProtocolFeatures,
+    VhostUserVirtioFeatures, VHOST_USER_FS_SLAVE_ENTRIES,
 };
 use vhost_rs::vhost_user::{
     HandlerResult, Master, MasterReqHandler, VhostUserMaster, VhostUserMasterReqHandler,
 };
 use vhost_rs::VhostBackend;
-use vm_device::{Migratable, MigratableError, Pausable, Snapshotable};
-use vm_memory::{ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
+use vm_memory::{
+    Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap,
+    MmapRegion,
+};
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
 const NUM_QUEUE_OFFSET: usize = 1;
 
 struct SlaveReqHandler {
+    cache_offset: GuestAddress,
     cache_size: u64,
     mmap_cache_addr: u64,
 }
 
+impl SlaveReqHandler {
+    // Make sure request is within cache range
+    fn is_req_valid(&self, offset: u64, len: u64) -> bool {
+        let end = match offset.checked_add(len) {
+            Some(n) => n,
+            None => return false,
+        };
+
+        !(offset >= self.cache_size || end > self.cache_size)
+    }
+}
+
 impl VhostUserMasterReqHandler for SlaveReqHandler {
-    fn handle_config_change(&mut self) -> HandlerResult<()> {
+    fn handle_config_change(&mut self) -> HandlerResult<u64> {
         debug!("handle_config_change");
-        Ok(())
+        Ok(0)
     }
 
-    fn fs_slave_map(&mut self, fs: &VhostUserFSSlaveMsg, fd: RawFd) -> HandlerResult<()> {
+    fn fs_slave_map(&mut self, fs: &VhostUserFSSlaveMsg, fd: RawFd) -> HandlerResult<u64> {
         debug!("fs_slave_map");
 
         for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
+            let offset = fs.cache_offset[i];
+            let len = fs.len[i];
+
             // Ignore if the length is 0.
-            if fs.len[i] == 0 {
+            if len == 0 {
                 continue;
             }
 
-            if fs.cache_offset[i] > self.cache_size {
-                return Err(io::Error::new(io::ErrorKind::Other, "Wrong offset"));
+            if !self.is_req_valid(offset, len) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
 
-            let addr = self.mmap_cache_addr + fs.cache_offset[i];
+            let addr = self.mmap_cache_addr + offset;
             let ret = unsafe {
                 libc::mmap(
                     addr as *mut libc::c_void,
-                    fs.len[i] as usize,
+                    len as usize,
                     fs.flags[i].bits() as i32,
                     libc::MAP_SHARED | libc::MAP_FIXED,
                     fd,
@@ -77,13 +96,14 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
             }
         }
 
-        Ok(())
+        Ok(0)
     }
 
-    fn fs_slave_unmap(&mut self, fs: &VhostUserFSSlaveMsg) -> HandlerResult<()> {
+    fn fs_slave_unmap(&mut self, fs: &VhostUserFSSlaveMsg) -> HandlerResult<u64> {
         debug!("fs_slave_unmap");
 
         for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
+            let offset = fs.cache_offset[i];
             let mut len = fs.len[i];
 
             // Ignore if the length is 0.
@@ -97,11 +117,11 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
                 len = self.cache_size;
             }
 
-            if fs.cache_offset[i] > self.cache_size {
-                return Err(io::Error::new(io::ErrorKind::Other, "Wrong offset"));
+            if !self.is_req_valid(offset, len) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
 
-            let addr = self.mmap_cache_addr + fs.cache_offset[i];
+            let addr = self.mmap_cache_addr + offset;
             let ret = unsafe {
                 libc::mmap(
                     addr as *mut libc::c_void,
@@ -117,32 +137,99 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
             }
         }
 
-        Ok(())
+        Ok(0)
     }
 
-    fn fs_slave_sync(&mut self, fs: &VhostUserFSSlaveMsg) -> HandlerResult<()> {
+    fn fs_slave_sync(&mut self, fs: &VhostUserFSSlaveMsg) -> HandlerResult<u64> {
         debug!("fs_slave_sync");
 
+        for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
+            let offset = fs.cache_offset[i];
+            let len = fs.len[i];
+
+            // Ignore if the length is 0.
+            if len == 0 {
+                continue;
+            }
+
+            if !self.is_req_valid(offset, len) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+
+            let addr = self.mmap_cache_addr + offset;
+            let ret =
+                unsafe { libc::msync(addr as *mut libc::c_void, len as usize, libc::MS_SYNC) };
+            if ret == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        Ok(0)
+    }
+
+    fn fs_slave_io(&mut self, fs: &VhostUserFSSlaveMsg, fd: RawFd) -> HandlerResult<u64> {
+        debug!("fs_slave_io");
+
+        let mut done: u64 = 0;
         for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
             // Ignore if the length is 0.
             if fs.len[i] == 0 {
                 continue;
             }
 
-            if fs.cache_offset[i] > self.cache_size {
-                return Err(io::Error::new(io::ErrorKind::Other, "Wrong offset"));
+            let mut foffset = fs.fd_offset[i];
+            let mut len = fs.len[i] as usize;
+            let gpa = fs.cache_offset[i];
+            let cache_end = self.cache_offset.raw_value() + self.cache_size;
+            let efault = libc::EFAULT;
+
+            let offset = gpa
+                .checked_sub(self.cache_offset.raw_value())
+                .ok_or_else(|| io::Error::from_raw_os_error(efault))?;
+            let end = gpa
+                .checked_add(fs.len[i])
+                .ok_or_else(|| io::Error::from_raw_os_error(efault))?;
+
+            if gpa < self.cache_offset.raw_value() || gpa >= cache_end || end >= cache_end {
+                return Err(io::Error::from_raw_os_error(efault));
             }
 
-            let addr = self.mmap_cache_addr + fs.cache_offset[i];
-            let ret = unsafe {
-                libc::msync(addr as *mut libc::c_void, fs.len[i] as usize, libc::MS_SYNC)
-            };
-            if ret == -1 {
-                return Err(io::Error::last_os_error());
+            let mut ptr = self.mmap_cache_addr + offset;
+            while len > 0 {
+                let ret = if (fs.flags[i] & VhostUserFSSlaveMsgFlags::MAP_W)
+                    == VhostUserFSSlaveMsgFlags::MAP_W
+                {
+                    debug!("write: foffset={}, len={}", foffset, len);
+                    unsafe { pwrite64(fd, ptr as *const c_void, len as usize, foffset as off64_t) }
+                } else {
+                    debug!("read: foffset={}, len={}", foffset, len);
+                    unsafe { pread64(fd, ptr as *mut c_void, len as usize, foffset as off64_t) }
+                };
+
+                if ret < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                if ret == 0 {
+                    // EOF
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to access whole buffer",
+                    ));
+                }
+                len -= ret as usize;
+                foffset += ret as u64;
+                ptr += ret as u64;
+                done += ret as u64;
             }
         }
 
-        Ok(())
+        let ret = unsafe { libc::close(fd) };
+        if ret == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(done)
     }
 }
 
@@ -172,7 +259,9 @@ pub struct Fs {
     config: VirtioFsConfig,
     kill_evt: Option<EventFd>,
     pause_evt: Option<EventFd>,
-    cache: Option<(VirtioSharedMemoryList, u64)>,
+    // Hold ownership of the memory that is allocated for the device
+    // which will be automatically dropped when the device is dropped
+    cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
     slave_req_support: bool,
     queue_evts: Option<Vec<EventFd>>,
     interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
@@ -187,7 +276,7 @@ impl Fs {
         tag: &str,
         req_num_queues: usize,
         queue_size: u16,
-        cache: Option<(VirtioSharedMemoryList, u64)>,
+        cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
     ) -> Result<Fs> {
         let mut slave_req_support = false;
 
@@ -385,10 +474,11 @@ impl VirtioDevice for Fs {
 
         // Initialize slave communication.
         let slave_req_handler = if self.slave_req_support {
-            if let Some(cache) = self.cache.clone() {
+            if let Some(cache) = self.cache.as_ref() {
                 let vu_master_req_handler = Arc::new(Mutex::new(SlaveReqHandler {
+                    cache_offset: cache.0.addr,
                     cache_size: cache.0.len,
-                    mmap_cache_addr: cache.1,
+                    mmap_cache_addr: cache.0.host_addr,
                 }));
 
                 let req_handler = MasterReqHandler::new(vu_master_req_handler).map_err(|e| {
@@ -454,15 +544,51 @@ impl VirtioDevice for Fs {
         ))
     }
 
+    fn shutdown(&mut self) {
+        let _ = unsafe { libc::close(self.vu.as_raw_fd()) };
+    }
+
     fn get_shm_regions(&self) -> Option<VirtioSharedMemoryList> {
-        if let Some(cache) = self.cache.clone() {
-            Some(cache.0)
+        if let Some(cache) = self.cache.as_ref() {
+            Some(cache.0.clone())
         } else {
             None
         }
     }
+
+    fn set_shm_regions(
+        &mut self,
+        shm_regions: VirtioSharedMemoryList,
+    ) -> std::result::Result<(), crate::Error> {
+        if let Some(mut cache) = self.cache.as_mut() {
+            cache.0 = shm_regions;
+            Ok(())
+        } else {
+            Err(crate::Error::SetShmRegionsNotSupported)
+        }
+    }
+
+    fn update_memory(&mut self, mem: &GuestMemoryMmap) -> std::result::Result<(), crate::Error> {
+        update_mem_table(&mut self.vu, mem).map_err(crate::Error::VhostUserUpdateMemory)
+    }
+
+    fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
+        let mut mappings = Vec::new();
+        if let Some(cache) = self.cache.as_ref() {
+            mappings.push(UserspaceMapping {
+                host_addr: cache.0.host_addr,
+                mem_slot: cache.0.mem_slot,
+                addr: cache.0.addr,
+                len: cache.0.len,
+                mergeable: false,
+            })
+        }
+
+        mappings
+    }
 }
 
 virtio_pausable!(Fs);
-impl Snapshotable for Fs {}
+impl Snapshottable for Fs {}
+impl Transportable for Fs {}
 impl Migratable for Fs {}

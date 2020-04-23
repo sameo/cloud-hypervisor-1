@@ -68,6 +68,32 @@ if [ ! -f "$EOAN_OS_RAW_IMAGE" ]; then
     popd
 fi
 
+ALPINE_MINIROOTFS_URL="http://dl-cdn.alpinelinux.org/alpine/v3.11/releases/x86_64/alpine-minirootfs-3.11.3-x86_64.tar.gz"
+ALPINE_MINIROOTFS_TARBALL="$WORKLOADS_DIR/alpine-minirootfs-x86_64.tar.gz"
+if [ ! -f "$ALPINE_MINIROOTFS_TARBALL" ]; then
+    pushd $WORKLOADS_DIR
+    time wget --quiet $ALPINE_MINIROOTFS_URL -O $ALPINE_MINIROOTFS_TARBALL || exit 1
+    popd
+fi
+
+ALPINE_INITRAMFS_IMAGE="$WORKLOADS_DIR/alpine_initramfs.img"
+if [ ! -f "$ALPINE_INITRAMFS_IMAGE" ]; then
+    pushd $WORKLOADS_DIR
+    mkdir alpine-minirootfs
+    tar xf "$ALPINE_MINIROOTFS_TARBALL" -C alpine-minirootfs
+    cat > alpine-minirootfs/init <<-EOF
+		#! /bin/sh
+		mount -t devtmpfs dev /dev
+		echo \$TEST_STRING > /dev/console
+		poweroff -f
+	EOF
+    chmod +x alpine-minirootfs/init
+    cd alpine-minirootfs
+    find . -print0 |
+        cpio --null --create --verbose --owner root:root --format=newc > "$ALPINE_INITRAMFS_IMAGE"
+    popd
+fi
+
 pushd $WORKLOADS_DIR
 sha1sum sha1sums --check
 if [ $? -ne 0 ]; then
@@ -78,22 +104,38 @@ popd
 
 # Build custom kernel based on virtio-pmem and virtio-fs upstream patches
 VMLINUX_IMAGE="$WORKLOADS_DIR/vmlinux"
+VMLINUX_PVH_IMAGE="$WORKLOADS_DIR/vmlinux.pvh"
 BZIMAGE_IMAGE="$WORKLOADS_DIR/bzImage"
 
-LINUX_CUSTOM_DIR="linux-custom"
+LINUX_CUSTOM_DIR="$WORKLOADS_DIR/linux-custom"
 
-if [ ! -f "$VMLINUX_IMAGE" ]; then
+if [ ! -f "$VMLINUX_IMAGE" ] || [ ! -f "$VMLINUX_PVH_IMAGE" ]; then
     SRCDIR=$PWD
     pushd $WORKLOADS_DIR
     time git clone --depth 1 "https://github.com/cloud-hypervisor/linux.git" -b "virtio-fs-virtio-iommu-virtio-mem-5.6-rc4" $LINUX_CUSTOM_DIR
+    cp $SRCDIR/resources/linux-config $LINUX_CUSTOM_DIR/.config
+    popd
+fi
+
+if [ ! -f "$VMLINUX_IMAGE" ]; then
     pushd $LINUX_CUSTOM_DIR
-    cp $SRCDIR/resources/linux-config .config
+    scripts/config --disable "CONFIG_PVH"
     time make bzImage -j `nproc`
     cp vmlinux $VMLINUX_IMAGE || exit 1
     cp arch/x86/boot/bzImage $BZIMAGE_IMAGE || exit 1
     popd
-    rm -rf $LINUX_CUSTOM_DIR
+fi
+
+if [ ! -f "$VMLINUX_PVH_IMAGE" ]; then
+    pushd $LINUX_CUSTOM_DIR
+    scripts/config --enable "CONFIG_PVH"
+    time make bzImage -j `nproc`
+    cp vmlinux $VMLINUX_PVH_IMAGE || exit 1
     popd
+fi
+
+if [ -d "$LINUX_CUSTOM_DIR" ]; then
+    rm -rf $LINUX_CUSTOM_DIR
 fi
 
 VIRTIOFSD="$WORKLOADS_DIR/virtiofsd"
@@ -199,6 +241,10 @@ if [ $RES -eq 0 ]; then
     # virtio-mmio based testing
     cargo build --release --no-default-features --features "mmio"
     sudo setcap cap_net_admin+ep target/release/cloud-hypervisor
+
+    # Ensure test binary has the same caps as the cloud-hypervisor one
+    time cargo test --no-run --features "integration_tests,mmio" -- --nocapture || exit 1
+    ls target/debug/deps/cloud_hypervisor-* | xargs -n 1 sudo setcap cap_net_admin+ep
 
     newgrp kvm << EOF
 export RUST_BACKTRACE=1

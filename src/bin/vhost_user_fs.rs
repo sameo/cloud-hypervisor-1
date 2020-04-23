@@ -11,10 +11,11 @@ extern crate vm_virtio;
 
 use clap::{App, Arg};
 use epoll;
+use futures::executor::{ThreadPool, ThreadPoolBuilder};
 use libc::EFD_NONBLOCK;
 use log::*;
 use std::num::Wrapping;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::{convert, error, fmt, io, process};
 
 use vhost_rs::vhost_user::message::*;
@@ -30,11 +31,13 @@ use virtio_bindings::bindings::virtio_net::*;
 use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
 };
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
+use vm_virtio::queue::DescriptorChain;
 use vmm_sys_util::eventfd::EventFd;
 
 const QUEUE_SIZE: usize = 1024;
 const NUM_QUEUES: usize = 2;
+const THREAD_POOL_SIZE: usize = 64;
 
 // The guest queued an available buffer for the high priority queue.
 const HIPRIO_QUEUE_EVENT: u16 = 0;
@@ -50,6 +53,8 @@ type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
 enum Error {
     /// Failed to create kill eventfd.
     CreateKillEventFd(io::Error),
+    /// Failed to create thread pool.
+    CreateThreadPool(io::Error),
     /// Failed to handle event other than input event.
     HandleEventNotEpollIn,
     /// Failed to handle unknown event.
@@ -62,8 +67,6 @@ enum Error {
     QueueReader(VufDescriptorError),
     /// Creating a queue writer failed.
     QueueWriter(VufDescriptorError),
-    /// Signaling queue failed.
-    SignalQueue(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -80,66 +83,107 @@ impl convert::From<Error> for io::Error {
     }
 }
 
-struct VhostUserFsBackend<F: FileSystem + Send + Sync + 'static> {
-    mem: Option<GuestMemoryMmap>,
+struct VhostUserFsThread<F: FileSystem + Send + Sync + 'static> {
+    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     kill_evt: EventFd,
     server: Arc<Server<F>>,
     // handle request from slave to master
     vu_req: Option<SlaveFsCacheReq>,
     event_idx: bool,
+    pool: ThreadPool,
 }
 
-impl<F: FileSystem + Send + Sync + 'static> Clone for VhostUserFsBackend<F> {
+impl<F: FileSystem + Send + Sync + 'static> Clone for VhostUserFsThread<F> {
     fn clone(&self) -> Self {
-        VhostUserFsBackend {
+        VhostUserFsThread {
             mem: self.mem.clone(),
             kill_evt: self.kill_evt.try_clone().unwrap(),
             server: self.server.clone(),
             vu_req: self.vu_req.clone(),
             event_idx: self.event_idx,
+            pool: self.pool.clone(),
         }
     }
 }
 
-impl<F: FileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
-    fn new(fs: F) -> Result<Self> {
-        Ok(VhostUserFsBackend {
+impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
+    fn new(fs: F, thread_pool_size: usize) -> Result<Self> {
+        Ok(VhostUserFsThread {
             mem: None,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
             server: Arc::new(Server::new(fs)),
             vu_req: None,
             event_idx: false,
+            pool: ThreadPoolBuilder::new()
+                .pool_size(thread_pool_size)
+                .create()
+                .map_err(Error::CreateThreadPool)?,
         })
     }
 
-    fn process_queue(&mut self, vring: &mut Vring) -> Result<bool> {
+    fn process_queue(&mut self, vring_lock: Arc<RwLock<Vring>>) -> Result<bool> {
         let mut used_any = false;
-        let mem = self.mem.as_ref().ok_or(Error::NoMemoryConfigured)?;
+        let (atomic_mem, mem) = match &self.mem {
+            Some(m) => (m, m.memory()),
+            None => return Err(Error::NoMemoryConfigured),
+        };
+        let mut vring = vring_lock.write().unwrap();
 
         while let Some(avail_desc) = vring.mut_queue().iter(&mem).next() {
-            let head_index = avail_desc.index;
-            let reader = Reader::new(mem, avail_desc.clone()).map_err(Error::QueueReader)?;
-            let writer = Writer::new(mem, avail_desc.clone()).map_err(Error::QueueWriter)?;
+            used_any = true;
 
-            self.server
-                .handle_message(reader, writer, self.vu_req.as_mut())
-                .map_err(Error::ProcessQueue)?;
-            if self.event_idx {
-                if let Some(used_idx) = vring.mut_queue().add_used(mem, head_index, 0) {
-                    if vring.needs_notification(&mem, Wrapping(used_idx)) {
-                        vring.signal_used_queue().map_err(Error::SignalQueue)?;
+            // Prepare a set of objects that can be moved to the worker thread.
+            let desc_head = avail_desc.get_head();
+            let atomic_mem = atomic_mem.clone();
+            let server = self.server.clone();
+            let mut vu_req = self.vu_req.clone();
+            let event_idx = self.event_idx;
+            let vring_lock = vring_lock.clone();
+
+            self.pool.spawn_ok(async move {
+                let mem = atomic_mem.memory();
+                let desc = DescriptorChain::new_from_head(&mem, desc_head).unwrap();
+                let head_index = desc.index;
+
+                let reader = Reader::new(&mem, desc.clone())
+                    .map_err(Error::QueueReader)
+                    .unwrap();
+                let writer = Writer::new(&mem, desc.clone())
+                    .map_err(Error::QueueWriter)
+                    .unwrap();
+
+                server
+                    .handle_message(reader, writer, vu_req.as_mut())
+                    .map_err(Error::ProcessQueue)
+                    .unwrap();
+
+                let mut vring = vring_lock.write().unwrap();
+
+                if event_idx {
+                    if let Some(used_idx) = vring.mut_queue().add_used(&mem, head_index, 0) {
+                        if vring.needs_notification(&mem, Wrapping(used_idx)) {
+                            vring.signal_used_queue().unwrap();
+                        }
                     }
-                    used_any = true;
+                } else {
+                    vring.mut_queue().add_used(&mem, head_index, 0);
+                    vring.signal_used_queue().unwrap();
                 }
-            } else {
-                vring.mut_queue().add_used(mem, head_index, 0);
-                vring.signal_used_queue().map_err(Error::SignalQueue)?;
-                used_any = true;
-            }
-            vring.signal_used_queue().map_err(Error::SignalQueue)?;
+            });
         }
 
         Ok(used_any)
+    }
+}
+
+struct VhostUserFsBackend<F: FileSystem + Send + Sync + 'static> {
+    thread: Mutex<VhostUserFsThread<F>>,
+}
+
+impl<F: FileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
+    fn new(fs: F, thread_pool_size: usize) -> Result<Self> {
+        let thread = Mutex::new(VhostUserFsThread::new(fs, thread_pool_size)?);
+        Ok(VhostUserFsBackend { thread })
     }
 }
 
@@ -164,63 +208,74 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
-        self.event_idx = enabled;
+        self.thread.lock().unwrap().event_idx = enabled;
     }
 
     fn update_memory(&mut self, mem: GuestMemoryMmap) -> VhostUserBackendResult<()> {
-        self.mem = Some(mem);
+        self.thread.lock().unwrap().mem = Some(GuestMemoryAtomic::new(mem));
         Ok(())
     }
 
     fn handle_event(
-        &mut self,
+        &self,
         device_event: u16,
         evset: epoll::Events,
         vrings: &[Arc<RwLock<Vring>>],
+        _thread_id: usize,
     ) -> VhostUserBackendResult<bool> {
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
         }
 
-        let mut vring = match device_event {
+        let mut thread = self.thread.lock().unwrap();
+        let mem = match &thread.mem {
+            Some(m) => m.memory(),
+            None => return Err(Error::NoMemoryConfigured.into()),
+        };
+
+        let vring_lock = match device_event {
             HIPRIO_QUEUE_EVENT => {
                 debug!("HIPRIO_QUEUE_EVENT");
-                vrings[0].write().unwrap()
+                vrings[0].clone()
             }
             REQ_QUEUE_EVENT => {
                 debug!("QUEUE_EVENT");
-                vrings[1].write().unwrap()
+                vrings[1].clone()
             }
             _ => return Err(Error::HandleEventUnknownEvent.into()),
         };
 
-        if self.event_idx {
+        if thread.event_idx {
             // vm-virtio's Queue implementation only checks avail_index
             // once, so to properly support EVENT_IDX we need to keep
             // calling process_queue() until it stops finding new
             // requests on the queue.
             loop {
-                vring
-                    .mut_queue()
-                    .update_avail_event(self.mem.as_ref().ok_or(Error::NoMemoryConfigured)?);
-                if !self.process_queue(&mut vring)? {
+                {
+                    let mut vring = vring_lock.write().unwrap();
+                    vring.mut_queue().update_avail_event(&mem);
+                }
+                if !thread.process_queue(vring_lock.clone())? {
                     break;
                 }
             }
         } else {
             // Without EVENT_IDX, a single call is enough.
-            self.process_queue(&mut vring)?;
+            thread.process_queue(vring_lock)?;
         }
 
         Ok(false)
     }
 
-    fn exit_event(&self) -> Option<(EventFd, Option<u16>)> {
-        Some((self.kill_evt.try_clone().unwrap(), Some(KILL_EVENT)))
+    fn exit_event(&self, _thread_index: usize) -> Option<(EventFd, Option<u16>)> {
+        Some((
+            self.thread.lock().unwrap().kill_evt.try_clone().unwrap(),
+            Some(KILL_EVENT),
+        ))
     }
 
     fn set_slave_req_fd(&mut self, vu_req: SlaveFsCacheReq) {
-        self.vu_req = Some(vu_req);
+        self.thread.lock().unwrap().vu_req = Some(vu_req);
     }
 }
 
@@ -243,6 +298,18 @@ fn main() {
                 .takes_value(true)
                 .min_values(1),
         )
+        .arg(
+            Arg::with_name("thread-pool-size")
+                .long("thread-pool-size")
+                .help("thread pool size (default 64)")
+                .takes_value(true)
+                .min_values(1),
+        )
+        .arg(
+            Arg::with_name("disable-xattr")
+                .long("disable-xattr")
+                .help("Disable support for extended attributes"),
+        )
         .get_matches();
 
     // Retrieve arguments
@@ -252,16 +319,24 @@ fn main() {
     let sock = cmd_arguments
         .value_of("sock")
         .expect("Failed to retrieve vhost-user socket path");
+    let thread_pool_size: usize = match cmd_arguments.value_of("thread-pool-size") {
+        Some(size) => size.parse().expect("Invalid argument for thread-pool-size"),
+        None => THREAD_POOL_SIZE,
+    };
+    let xattr: bool = !cmd_arguments.is_present("disable-xattr");
 
     // Convert into appropriate types
     let sock = String::from(sock);
 
     let fs_cfg = passthrough::Config {
         root_dir: shared_dir.to_string(),
+        xattr,
         ..Default::default()
     };
     let fs = PassthroughFs::new(fs_cfg).unwrap();
-    let fs_backend = Arc::new(RwLock::new(VhostUserFsBackend::new(fs).unwrap()));
+    let fs_backend = Arc::new(RwLock::new(
+        VhostUserFsBackend::new(fs, thread_pool_size).unwrap(),
+    ));
 
     let mut daemon = VhostUserDaemon::new(
         String::from("vhost-user-fs-backend"),
@@ -279,7 +354,15 @@ fn main() {
         error!("Waiting for daemon failed: {:?}", e);
     }
 
-    let kill_evt = &fs_backend.read().unwrap().kill_evt;
+    let kill_evt = fs_backend
+        .read()
+        .unwrap()
+        .thread
+        .lock()
+        .unwrap()
+        .kill_evt
+        .try_clone()
+        .unwrap();
     if let Err(e) = kill_evt.write(1) {
         error!("Error shutting down worker thread: {:?}", e)
     }

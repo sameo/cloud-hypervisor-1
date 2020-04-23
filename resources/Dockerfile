@@ -1,6 +1,6 @@
 FROM ubuntu:18.04 as dev
 
-ARG RUST_TOOLCHAIN="1.40.0"
+ARG RUST_TOOLCHAIN="1.42.0"
 ARG CLH_SRC_DIR="/cloud-hypervisor"
 ARG CLH_BUILD_DIR="$CLH_SRC_DIR/build"
 ARG CARGO_REGISTRY_DIR="$CLH_BUILD_DIR/cargo_registry"
@@ -34,6 +34,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -yq \
 	libcap-ng-dev \
 	socat \
 	dosfstools \
+	cpio \
+	bsdtar \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

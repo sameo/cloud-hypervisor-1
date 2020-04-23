@@ -10,6 +10,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use devices::BusDevice;
 use std;
 use std::any::Any;
+use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 use vm_memory::{Address, GuestAddress, GuestUsize};
@@ -52,6 +53,7 @@ impl PciRoot {
                 config: PciConfiguration::new(
                     VENDOR_ID_INTEL,
                     DEVICE_ID_INTEL_VIRT_PCIE_HOST,
+                    0,
                     PciClassCode::BridgeDevice,
                     &PciBridgeSubclass::HostBridge,
                     None,
@@ -84,17 +86,17 @@ impl PciDevice for PciRoot {
 pub struct PciBus {
     /// Devices attached to this bus.
     /// Device 0 is host bridge.
-    devices: Vec<Arc<Mutex<dyn PciDevice>>>,
+    devices: HashMap<u32, Arc<Mutex<dyn PciDevice>>>,
     device_reloc: Arc<dyn DeviceRelocation>,
     device_ids: Vec<bool>,
 }
 
 impl PciBus {
     pub fn new(pci_root: PciRoot, device_reloc: Arc<dyn DeviceRelocation>) -> Self {
-        let mut devices: Vec<Arc<Mutex<dyn PciDevice>>> = Vec::new();
+        let mut devices: HashMap<u32, Arc<Mutex<dyn PciDevice>>> = HashMap::new();
         let mut device_ids: Vec<bool> = vec![false; NUM_DEVICE_IDS];
 
-        devices.push(Arc::new(Mutex::new(pci_root)));
+        devices.insert(0, Arc::new(Mutex::new(pci_root)));
         device_ids[0] = true;
 
         PciBus {
@@ -128,13 +130,17 @@ impl PciBus {
         Ok(())
     }
 
-    pub fn add_device(&mut self, device: Arc<Mutex<dyn PciDevice>>) -> Result<()> {
-        self.devices.push(device);
+    pub fn add_device(
+        &mut self,
+        pci_device_bdf: u32,
+        device: Arc<Mutex<dyn PciDevice>>,
+    ) -> Result<()> {
+        self.devices.insert(pci_device_bdf >> 3, device);
         Ok(())
     }
 
     pub fn remove_by_device(&mut self, device: &Arc<Mutex<dyn PciDevice>>) -> Result<()> {
-        self.devices.retain(|dev| !Arc::ptr_eq(dev, device));
+        self.devices.retain(|_, dev| !Arc::ptr_eq(dev, device));
         Ok(())
     }
 
@@ -196,7 +202,7 @@ impl PciConfigIo {
             .lock()
             .unwrap()
             .devices
-            .get(device)
+            .get(&(device as u32))
             .map_or(0xffff_ffff, |d| {
                 d.lock().unwrap().read_config_register(register)
             })
@@ -221,7 +227,7 @@ impl PciConfigIo {
         }
 
         let pci_bus = self.pci_bus.lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(device) {
+        if let Some(d) = pci_bus.devices.get(&(device as u32)) {
             let mut device = d.lock().unwrap();
 
             // Find out if one of the device's BAR is being reprogrammed, and
@@ -234,7 +240,10 @@ impl PciConfigIo {
                     device.deref_mut(),
                     params.region_type,
                 ) {
-                    error!("Failed moving device BAR: {}", e);
+                    error!(
+                        "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x})",
+                        e, params.old_base, params.new_base, params.len
+                    );
                 }
             }
 
@@ -318,7 +327,7 @@ impl PciConfigMmio {
             .lock()
             .unwrap()
             .devices
-            .get(device)
+            .get(&(device as u32))
             .map_or(0xffff_ffff, |d| {
                 d.lock().unwrap().read_config_register(register)
             })
@@ -337,7 +346,7 @@ impl PciConfigMmio {
         }
 
         let pci_bus = self.pci_bus.lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(device) {
+        if let Some(d) = pci_bus.devices.get(&(device as u32)) {
             let mut device = d.lock().unwrap();
 
             // Find out if one of the device's BAR is being reprogrammed, and
@@ -350,7 +359,10 @@ impl PciConfigMmio {
                     device.deref_mut(),
                     params.region_type,
                 ) {
-                    error!("Failed moving device BAR: {}", e);
+                    error!(
+                        "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x})",
+                        e, params.old_base, params.new_base, params.len
+                    );
                 }
             }
 

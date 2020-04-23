@@ -5,9 +5,11 @@
 
 use crate::api::http::EndpointHandler;
 use crate::api::{
-    vm_add_device, vm_boot, vm_create, vm_delete, vm_info, vm_pause, vm_reboot, vm_remove_device,
-    vm_resize, vm_resume, vm_shutdown, vmm_ping, vmm_shutdown, ApiError, ApiRequest, ApiResult,
-    DeviceConfig, VmAction, VmConfig, VmRemoveDeviceData, VmResizeData,
+    vm_add_device, vm_add_disk, vm_add_fs, vm_add_net, vm_add_pmem, vm_boot, vm_create, vm_delete,
+    vm_info, vm_pause, vm_reboot, vm_remove_device, vm_resize, vm_restore, vm_resume, vm_shutdown,
+    vm_snapshot, vmm_ping, vmm_shutdown, ApiError, ApiRequest, ApiResult, DeviceConfig, DiskConfig,
+    FsConfig, NetConfig, PmemConfig, RestoreConfig, VmAction, VmConfig, VmRemoveDeviceData,
+    VmResizeData, VmSnapshotConfig,
 };
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 use serde_json::Error as SerdeError;
@@ -42,6 +44,12 @@ pub enum HttpError {
     /// Could not reboot a VM
     VmReboot(ApiError),
 
+    /// Could not snapshot a VM
+    VmSnapshot(ApiError),
+
+    /// Could not restore a VM
+    VmRestore(ApiError),
+
     /// Could not act on a VM
     VmAction(ApiError),
 
@@ -59,6 +67,18 @@ pub enum HttpError {
 
     /// Could not handle VMM ping
     VmmPing(ApiError),
+
+    /// Could not add a disk to a VM
+    VmAddDisk(ApiError),
+
+    /// Could not add a fs to a VM
+    VmAddFs(ApiError),
+
+    /// Could not add a pmem device to a VM
+    VmAddPmem(ApiError),
+
+    /// Could not add a network device to a VM
+    VmAddNet(ApiError),
 }
 
 fn error_response(error: HttpError, status: StatusCode) -> Response {
@@ -177,6 +197,84 @@ impl EndpointHandler for VmInfo {
                 }
                 Err(e) => error_response(e, StatusCode::InternalServerError),
             },
+            _ => Response::new(Version::Http11, StatusCode::BadRequest),
+        }
+    }
+}
+
+// /api/v1/vm.snapshot handler
+pub struct VmSnapshot {}
+
+impl EndpointHandler for VmSnapshot {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        match req.method() {
+            Method::Put => {
+                match &req.body {
+                    Some(body) => {
+                        // Deserialize into a VmSnapshotConfig
+                        let vm_snapshot_data: VmSnapshotConfig =
+                            match serde_json::from_slice(body.raw())
+                                .map_err(HttpError::SerdeJsonDeserialize)
+                            {
+                                Ok(data) => data,
+                                Err(e) => return error_response(e, StatusCode::BadRequest),
+                            };
+
+                        // Call vm_snapshot()
+                        match vm_snapshot(api_notifier, api_sender, Arc::new(vm_snapshot_data))
+                            .map_err(HttpError::VmSnapshot)
+                        {
+                            Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
+                            Err(e) => error_response(e, StatusCode::InternalServerError),
+                        }
+                    }
+                    None => Response::new(Version::Http11, StatusCode::BadRequest),
+                }
+            }
+            _ => Response::new(Version::Http11, StatusCode::BadRequest),
+        }
+    }
+}
+
+// /api/v1/vm.restore handler
+pub struct VmRestore {}
+
+impl EndpointHandler for VmRestore {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        match req.method() {
+            Method::Put => {
+                match &req.body {
+                    Some(body) => {
+                        // Deserialize into a RestoreConfig
+                        let vm_restore_data: RestoreConfig =
+                            match serde_json::from_slice(body.raw())
+                                .map_err(HttpError::SerdeJsonDeserialize)
+                            {
+                                Ok(data) => data,
+                                Err(e) => return error_response(e, StatusCode::BadRequest),
+                            };
+
+                        // Call vm_restore()
+                        match vm_restore(api_notifier, api_sender, Arc::new(vm_restore_data))
+                            .map_err(HttpError::VmRestore)
+                        {
+                            Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
+                            Err(e) => error_response(e, StatusCode::InternalServerError),
+                        }
+                    }
+                    None => Response::new(Version::Http11, StatusCode::BadRequest),
+                }
+            }
             _ => Response::new(Version::Http11, StatusCode::BadRequest),
         }
     }
@@ -339,6 +437,160 @@ impl EndpointHandler for VmRemoveDevice {
                             Arc::new(vm_remove_device_data),
                         )
                         .map_err(HttpError::VmRemoveDevice)
+                        {
+                            Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
+                            Err(e) => error_response(e, StatusCode::InternalServerError),
+                        }
+                    }
+
+                    None => Response::new(Version::Http11, StatusCode::BadRequest),
+                }
+            }
+            _ => Response::new(Version::Http11, StatusCode::BadRequest),
+        }
+    }
+}
+
+// /api/v1/vm.add-disk handler
+pub struct VmAddDisk {}
+
+impl EndpointHandler for VmAddDisk {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        match req.method() {
+            Method::Put => {
+                match &req.body {
+                    Some(body) => {
+                        // Deserialize into a DiskConfig
+                        let vm_add_disk_data: DiskConfig = match serde_json::from_slice(body.raw())
+                            .map_err(HttpError::SerdeJsonDeserialize)
+                        {
+                            Ok(config) => config,
+                            Err(e) => return error_response(e, StatusCode::BadRequest),
+                        };
+
+                        // Call vm_add_device()
+                        match vm_add_disk(api_notifier, api_sender, Arc::new(vm_add_disk_data))
+                            .map_err(HttpError::VmAddDisk)
+                        {
+                            Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
+                            Err(e) => error_response(e, StatusCode::InternalServerError),
+                        }
+                    }
+
+                    None => Response::new(Version::Http11, StatusCode::BadRequest),
+                }
+            }
+            _ => Response::new(Version::Http11, StatusCode::BadRequest),
+        }
+    }
+}
+
+// /api/v1/vm.add-fs handler
+pub struct VmAddFs {}
+
+impl EndpointHandler for VmAddFs {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        match req.method() {
+            Method::Put => {
+                match &req.body {
+                    Some(body) => {
+                        // Deserialize into a FsConfig
+                        let vm_add_fs_data: FsConfig = match serde_json::from_slice(body.raw())
+                            .map_err(HttpError::SerdeJsonDeserialize)
+                        {
+                            Ok(config) => config,
+                            Err(e) => return error_response(e, StatusCode::BadRequest),
+                        };
+
+                        // Call vm_add_fs()
+                        match vm_add_fs(api_notifier, api_sender, Arc::new(vm_add_fs_data))
+                            .map_err(HttpError::VmAddFs)
+                        {
+                            Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
+                            Err(e) => error_response(e, StatusCode::InternalServerError),
+                        }
+                    }
+
+                    None => Response::new(Version::Http11, StatusCode::BadRequest),
+                }
+            }
+            _ => Response::new(Version::Http11, StatusCode::BadRequest),
+        }
+    }
+}
+
+// /api/v1/vm.add-pmem handler
+pub struct VmAddPmem {}
+
+impl EndpointHandler for VmAddPmem {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        match req.method() {
+            Method::Put => {
+                match &req.body {
+                    Some(body) => {
+                        // Deserialize into a PmemConfig
+                        let vm_add_pmem_data: PmemConfig = match serde_json::from_slice(body.raw())
+                            .map_err(HttpError::SerdeJsonDeserialize)
+                        {
+                            Ok(config) => config,
+                            Err(e) => return error_response(e, StatusCode::BadRequest),
+                        };
+
+                        match vm_add_pmem(api_notifier, api_sender, Arc::new(vm_add_pmem_data))
+                            .map_err(HttpError::VmAddPmem)
+                        {
+                            Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
+                            Err(e) => error_response(e, StatusCode::InternalServerError),
+                        }
+                    }
+
+                    None => Response::new(Version::Http11, StatusCode::BadRequest),
+                }
+            }
+            _ => Response::new(Version::Http11, StatusCode::BadRequest),
+        }
+    }
+}
+
+// /api/v1/vm.add-net handler
+pub struct VmAddNet {}
+
+impl EndpointHandler for VmAddNet {
+    fn handle_request(
+        &self,
+        req: &Request,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+    ) -> Response {
+        match req.method() {
+            Method::Put => {
+                match &req.body {
+                    Some(body) => {
+                        // Deserialize into a NetConfig
+                        let vm_add_net_data: NetConfig = match serde_json::from_slice(body.raw())
+                            .map_err(HttpError::SerdeJsonDeserialize)
+                        {
+                            Ok(config) => config,
+                            Err(e) => return error_response(e, StatusCode::BadRequest),
+                        };
+
+                        match vm_add_net(api_notifier, api_sender, Arc::new(vm_add_net_data))
+                            .map_err(HttpError::VmAddNet)
                         {
                             Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
                             Err(e) => error_response(e, StatusCode::InternalServerError),

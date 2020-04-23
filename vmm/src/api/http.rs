@@ -4,11 +4,14 @@
 //
 
 use crate::api::http_endpoint::{
-    VmActionHandler, VmAddDevice, VmCreate, VmInfo, VmRemoveDevice, VmResize, VmmPing, VmmShutdown,
+    VmActionHandler, VmAddDevice, VmAddDisk, VmAddFs, VmAddNet, VmAddPmem, VmCreate, VmInfo,
+    VmRemoveDevice, VmResize, VmRestore, VmSnapshot, VmmPing, VmmShutdown,
 };
 use crate::api::{ApiRequest, VmAction};
+use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::{Error, Result};
 use micro_http::{HttpServer, MediaType, Request, Response, StatusCode, Version};
+use seccomp::{SeccompFilter, SeccompLevel};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -59,11 +62,17 @@ lazy_static! {
         r.routes.insert(endpoint!("/vm.resume"), Box::new(VmActionHandler::new(VmAction::Resume)));
         r.routes.insert(endpoint!("/vm.shutdown"), Box::new(VmActionHandler::new(VmAction::Shutdown)));
         r.routes.insert(endpoint!("/vm.reboot"), Box::new(VmActionHandler::new(VmAction::Reboot)));
+        r.routes.insert(endpoint!("/vm.snapshot"), Box::new(VmSnapshot {}));
+        r.routes.insert(endpoint!("/vm.restore"), Box::new(VmRestore {}));
         r.routes.insert(endpoint!("/vmm.shutdown"), Box::new(VmmShutdown {}));
         r.routes.insert(endpoint!("/vmm.ping"), Box::new(VmmPing {}));
         r.routes.insert(endpoint!("/vm.resize"), Box::new(VmResize {}));
         r.routes.insert(endpoint!("/vm.add-device"), Box::new(VmAddDevice {}));
         r.routes.insert(endpoint!("/vm.remove-device"), Box::new(VmRemoveDevice {}));
+        r.routes.insert(endpoint!("/vm.add-disk"), Box::new(VmAddDisk {}));
+        r.routes.insert(endpoint!("/vm.add-fs"), Box::new(VmAddFs {}));
+        r.routes.insert(endpoint!("/vm.add-pmem"), Box::new(VmAddPmem {}));
+        r.routes.insert(endpoint!("/vm.add-net"), Box::new(VmAddNet {}));
 
         r
     };
@@ -92,13 +101,21 @@ pub fn start_http_thread(
     path: &str,
     api_notifier: EventFd,
     api_sender: Sender<ApiRequest>,
+    seccomp_level: &SeccompLevel,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     std::fs::remove_file(path).unwrap_or_default();
     let socket_path = PathBuf::from(path);
 
+    // Retrieve seccomp filter for API thread
+    let api_seccomp_filter =
+        get_seccomp_filter(seccomp_level, Thread::Api).map_err(Error::CreateSeccompFilter)?;
+
     thread::Builder::new()
         .name("http-server".to_string())
         .spawn(move || {
+            // Apply seccomp filter for API thread.
+            SeccompFilter::apply(api_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+
             let mut server = HttpServer::new(socket_path).unwrap();
             server.start_server().unwrap();
             loop {

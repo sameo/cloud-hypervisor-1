@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+extern crate anyhow;
 extern crate arc_swap;
 #[macro_use]
 extern crate lazy_static;
@@ -13,19 +14,25 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate tempfile;
+extern crate url;
 extern crate vmm_sys_util;
 
 use crate::api::{ApiError, ApiRequest, ApiResponse, ApiResponsePayload, VmInfo, VmmPingResponse};
-use crate::config::{DeviceConfig, VmConfig};
+use crate::config::{
+    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig, VmConfig,
+};
+use crate::migration::{recv_vm_snapshot, vm_config_from_snapshot};
+use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::vm::{Error as VmError, Vm, VmState};
 use libc::EFD_NONBLOCK;
+use seccomp::{SeccompFilter, SeccompLevel};
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
 use std::sync::{Arc, Mutex};
 use std::{result, thread};
-use vm_device::Pausable;
+use vm_migration::{Pausable, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
 pub mod api;
@@ -34,6 +41,8 @@ pub mod cpu;
 pub mod device_manager;
 pub mod interrupt;
 pub mod memory_manager;
+pub mod migration;
+pub mod seccomp_filters;
 pub mod vm;
 
 #[cfg(feature = "acpi")]
@@ -84,6 +93,12 @@ pub enum Error {
 
     // Error following "exe" link
     ExePathReadLink(io::Error),
+
+    /// Cannot create seccomp filter
+    CreateSeccompFilter(seccomp::SeccompError),
+
+    /// Cannot apply seccomp filter
+    ApplySeccompFilter(seccomp::Error),
 }
 pub type Result<T> = result::Result<T, Error>;
 
@@ -161,8 +176,13 @@ pub fn start_vmm_thread(
     api_event: EventFd,
     api_sender: Sender<ApiRequest>,
     api_receiver: Receiver<ApiRequest>,
+    seccomp_level: &SeccompLevel,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     let http_api_event = api_event.try_clone().map_err(Error::EventFdClone)?;
+
+    // Retrieve seccomp filter
+    let vmm_seccomp_filter =
+        get_seccomp_filter(seccomp_level, Thread::Vmm).map_err(Error::CreateSeccompFilter)?;
 
     // Find the path that the "/proc/<pid>/exe" symlink points to. Must be done before spawning
     // a thread as Rust does not put the child threads in the same thread group which prevents the
@@ -173,6 +193,9 @@ pub fn start_vmm_thread(
     let thread = thread::Builder::new()
         .name("vmm".to_string())
         .spawn(move || {
+            // Apply seccomp filter for VMM thread.
+            SeccompFilter::apply(vmm_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+
             let mut vmm = Vmm::new(vmm_version.to_string(), api_event, vmm_path)?;
 
             vmm.control_loop(Arc::new(api_receiver))
@@ -180,7 +203,7 @@ pub fn start_vmm_thread(
         .map_err(Error::VmmThreadSpawn)?;
 
     // The VMM thread is started, we can start serving HTTP requests
-    api::start_http_thread(http_path, http_api_event, api_sender)?;
+    api::start_http_thread(http_path, http_api_event, api_sender, seccomp_level)?;
 
     Ok(thread)
 }
@@ -268,6 +291,57 @@ impl Vmm {
             vm.resume().map_err(VmError::Resume)
         } else {
             Err(VmError::VmNotRunning)
+        }
+    }
+
+    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+        if let Some(ref mut vm) = self.vm {
+            vm.snapshot()
+                .map_err(VmError::Snapshot)
+                .and_then(|snapshot| {
+                    vm.send(&snapshot, destination_url)
+                        .map_err(VmError::SnapshotSend)
+                })
+        } else {
+            Err(VmError::VmNotRunning)
+        }
+    }
+
+    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
+        if self.vm.is_some() || self.vm_config.is_some() {
+            return Err(VmError::VmAlreadyCreated);
+        }
+
+        let source_url = restore_cfg.source_url.as_path().to_str();
+        if source_url.is_none() {
+            return Err(VmError::RestoreSourceUrlPathToStr);
+        }
+        // Safe to unwrap as we checked it was Some(&str).
+        let source_url = source_url.unwrap();
+
+        let vm_snapshot = recv_vm_snapshot(source_url).map_err(VmError::Restore)?;
+        let vm_config = vm_config_from_snapshot(&vm_snapshot).map_err(VmError::Restore)?;
+
+        self.vm_config = Some(Arc::clone(&vm_config));
+
+        let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
+        let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
+
+        let vm = Vm::new_from_snapshot(
+            &vm_snapshot,
+            exit_evt,
+            reset_evt,
+            self.vmm_path.clone(),
+            source_url,
+            restore_cfg.prefault,
+        )?;
+        self.vm = Some(vm);
+
+        // Now we can restore the rest of the VM.
+        if let Some(ref mut vm) = self.vm {
+            vm.restore(vm_snapshot).map_err(VmError::Restore)
+        } else {
+            Err(VmError::VmNotCreated)
         }
     }
 
@@ -388,7 +462,59 @@ impl Vmm {
     fn vm_remove_device(&mut self, id: String) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             if let Err(e) = vm.remove_device(id) {
-                error!("Error when adding new device to the VM: {:?}", e);
+                error!("Error when removing new device to the VM: {:?}", e);
+                Err(e)
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(VmError::VmNotRunning)
+        }
+    }
+
+    fn vm_add_disk(&mut self, disk_cfg: DiskConfig) -> result::Result<(), VmError> {
+        if let Some(ref mut vm) = self.vm {
+            if let Err(e) = vm.add_disk(disk_cfg) {
+                error!("Error when adding new disk to the VM: {:?}", e);
+                Err(e)
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(VmError::VmNotRunning)
+        }
+    }
+
+    fn vm_add_fs(&mut self, fs_cfg: FsConfig) -> result::Result<(), VmError> {
+        if let Some(ref mut vm) = self.vm {
+            if let Err(e) = vm.add_fs(fs_cfg) {
+                error!("Error when adding new fs to the VM: {:?}", e);
+                Err(e)
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(VmError::VmNotRunning)
+        }
+    }
+
+    fn vm_add_pmem(&mut self, pmem_cfg: PmemConfig) -> result::Result<(), VmError> {
+        if let Some(ref mut vm) = self.vm {
+            if let Err(e) = vm.add_pmem(pmem_cfg) {
+                error!("Error when adding new pmem device to the VM: {:?}", e);
+                Err(e)
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(VmError::VmNotRunning)
+        }
+    }
+
+    fn vm_add_net(&mut self, net_cfg: NetConfig) -> result::Result<(), VmError> {
+        if let Some(ref mut vm) = self.vm {
+            if let Err(e) = vm.add_net(net_cfg) {
+                error!("Error when adding new network device to the VM: {:?}", e);
                 Err(e)
             } else {
                 Ok(())
@@ -533,6 +659,22 @@ impl Vmm {
 
                                     sender.send(response).map_err(Error::ApiResponseSend)?;
                                 }
+                                ApiRequest::VmSnapshot(snapshot_data, sender) => {
+                                    let response = self
+                                        .vm_snapshot(&snapshot_data.destination_url)
+                                        .map_err(ApiError::VmSnapshot)
+                                        .map(|_| ApiResponsePayload::Empty);
+
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmRestore(restore_data, sender) => {
+                                    let response = self
+                                        .vm_restore(restore_data.as_ref().clone())
+                                        .map_err(ApiError::VmRestore)
+                                        .map(|_| ApiResponsePayload::Empty);
+
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
                                 ApiRequest::VmmShutdown(sender) => {
                                     let response = self
                                         .vmm_shutdown()
@@ -567,6 +709,34 @@ impl Vmm {
                                         .map(|_| ApiResponsePayload::Empty);
                                     sender.send(response).map_err(Error::ApiResponseSend)?;
                                 }
+                                ApiRequest::VmAddDisk(add_disk_data, sender) => {
+                                    let response = self
+                                        .vm_add_disk(add_disk_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddDisk)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddFs(add_fs_data, sender) => {
+                                    let response = self
+                                        .vm_add_fs(add_fs_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddFs)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddPmem(add_pmem_data, sender) => {
+                                    let response = self
+                                        .vm_add_pmem(add_pmem_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddPmem)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddNet(add_net_data, sender) => {
+                                    let response = self
+                                        .vm_add_net(add_net_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddNet)
+                                        .map(|_| ApiResponsePayload::Empty);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
                             }
                         }
                     }
@@ -577,3 +747,7 @@ impl Vmm {
         Ok(())
     }
 }
+
+const CPU_MANAGER_SNAPSHOT_ID: &str = "cpu-manager";
+const MEMORY_MANAGER_SNAPSHOT_ID: &str = "memory-manager";
+const DEVICE_MANAGER_SNAPSHOT_ID: &str = "device-manager";

@@ -30,6 +30,7 @@ mod tests {
     use std::sync::Mutex;
     use std::thread;
     use tempdir::TempDir;
+    use tempfile::NamedTempFile;
 
     lazy_static! {
         static ref NEXT_VM_ID: Mutex<u8> = Mutex::new(1);
@@ -94,6 +95,12 @@ mod tests {
 
     const BIONIC_IMAGE_NAME: &str = "bionic-server-cloudimg-amd64-raw.img";
     const EOAN_IMAGE_NAME: &str = "eoan-server-cloudimg-amd64-raw.img";
+
+    const CLEAR_KERNEL_CMDLINE: &str = "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c \
+                     console=tty0 console=ttyS0,115200n8 console=hvc0 quiet \
+                     init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable \
+                     no_timer_check noreplace-smp cryptomgr.notests \
+                     rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw";
 
     impl UbuntuDiskConfig {
         fn new(image_name: String) -> Self {
@@ -410,6 +417,13 @@ mod tests {
         )
     }
 
+    // Creates the directory and returns the path.
+    fn temp_snapshot_dir_path(tmp_dir: &TempDir) -> String {
+        let snapshot_dir = String::from(tmp_dir.path().join("snapshot").to_str().unwrap());
+        std::fs::create_dir(&snapshot_dir).unwrap();
+        snapshot_dir
+    }
+
     fn prepare_vhost_user_net_daemon(
         tmp_dir: &TempDir,
         ip: &str,
@@ -680,6 +694,14 @@ mod tests {
         fn get_total_memory(&self) -> Result<u32, Error> {
             Ok(self
                 .ssh_command("grep MemTotal /proc/meminfo | grep -o \"[0-9]*\"")?
+                .trim()
+                .parse()
+                .map_err(Error::Parsing)?)
+        }
+
+        fn get_total_memory_l2(&self) -> Result<u32, Error> {
+            Ok(self
+                .ssh_command_l2_1("grep MemTotal /proc/meminfo | grep -o \"[0-9]*\"")?
                 .trim()
                 .parse()
                 .map_err(Error::Parsing)?)
@@ -1019,12 +1041,57 @@ mod tests {
             kernel_path.push("vmlinux");
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus","boot=1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
+                .spawn()
+                .unwrap();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            aver_eq!(tb, guest.get_cpu_count().unwrap_or_default(), 1);
+            aver!(tb, guest.get_total_memory().unwrap_or_default() > 496_000);
+            aver!(tb, guest.get_entropy().unwrap_or_default() >= 900);
+
+            #[cfg(not(feature = "mmio"))]
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("grep -c PCI-MSI /proc/interrupts")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                12
+            );
+
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_pvh_boot() {
+        test_block!(tb, "", {
+            let mut clear = ClearDiskConfig::new();
+            let guest = Guest::new(&mut clear);
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+
+            let mut kernel_path = workload_path;
+            kernel_path.push("vmlinux.pvh");
+
+            let mut child = GuestCommand::new(&guest)
+                .args(&["--cpus", "boot=1"])
+                .args(&["--memory", "size=512M"])
+                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .default_disks()
+                .default_net()
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .spawn()
                 .unwrap();
 
@@ -1064,12 +1131,12 @@ mod tests {
             kernel_path.push("bzImage");
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus","boot=1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .spawn()
                 .unwrap();
 
@@ -1176,41 +1243,57 @@ mod tests {
         });
     }
 
+    type PrepareNetDaemon =
+        dyn Fn(&TempDir, &str, Option<&str>, usize) -> (std::process::Child, String);
+
     fn test_vhost_user_net(
         tap: Option<&str>,
         num_queues: usize,
-        prepare_vhost_user_net_daemon: &dyn Fn(
-            &TempDir,
-            &str,
-            Option<&str>,
-            usize,
-        ) -> (std::process::Child, String),
+        prepare_vhost_user_net_daemon: Option<&PrepareNetDaemon>,
+        self_spawned: bool,
     ) {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
+            let api_socket = temp_api_path(&guest.tmp_dir);
 
-            // Start the daemon
-            let (mut daemon_child, vunet_socket_path) = prepare_vhost_user_net_daemon(
-                &guest.tmp_dir,
-                &guest.network.host_ip,
-                tap,
-                num_queues,
-            );
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
 
-            let mut cloud_child = GuestCommand::new(&guest)
-                .args(&["--cpus", format!("boot={}", num_queues / 2).as_str()])
-                .args(&["--memory", "size=512M,file=/dev/shm"])
-                .args(&["--kernel", guest.fw_path.as_str()])
-                .default_disks()
-                .args(&[
-                    "--net",
+            let mut kernel_path = workload_path;
+            kernel_path.push("vmlinux");
+
+            let (net_params, daemon_child) = if self_spawned {
+                (
+                    format!(
+                        "vhost_user=true,mac={},ip={},mask=255.255.255.0,num_queues={},queue_size=1024",
+                        guest.network.guest_mac, guest.network.host_ip, num_queues,
+                    ),
+                    None,
+                )
+            } else {
+                let prepare_daemon = prepare_vhost_user_net_daemon.unwrap();
+                // Start the daemon
+                let (daemon_child, vunet_socket_path) =
+                    prepare_daemon(&guest.tmp_dir, &guest.network.host_ip, tap, num_queues);
+
+                (
                     format!(
                         "vhost_user=true,mac={},socket={},num_queues={},queue_size=1024",
                         guest.network.guest_mac, vunet_socket_path, num_queues,
-                    )
-                    .as_str(),
-                ])
+                    ),
+                    Some(daemon_child),
+                )
+            };
+
+            let mut cloud_child = GuestCommand::new(&guest)
+                .args(&["--cpus", format!("boot={}", num_queues / 2).as_str()])
+                .args(&["--memory", "size=512M,hotplug_size=2048M,file=/dev/shm"])
+                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
+                .default_disks()
+                .args(&["--net", net_params.as_str()])
+                .args(&["--api-socket", &api_socket])
                 .spawn()
                 .unwrap();
 
@@ -1241,6 +1324,8 @@ mod tests {
             // Since virtio-net has 2 queue pairs, its vectors is as follows:
             // 1 virtio-net     with 5 vectors: config, Rx (2), Tx (2)
             // Based on the above, the total vectors should 14.
+            // This is a PCI only feature.
+            #[cfg(not(feature = "mmio"))]
             aver_eq!(
                 tb,
                 guest
@@ -1252,115 +1337,129 @@ mod tests {
                 10 + (num_queues as u32)
             );
 
-            let _ = cloud_child.kill();
-            let _ = cloud_child.wait();
-
-            thread::sleep(std::time::Duration::new(5, 0));
-            let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
-
-            Ok(())
-        });
-    }
-
-    #[cfg_attr(not(feature = "mmio"), test)]
-    fn test_vhost_user_net_default() {
-        test_vhost_user_net(None, 2, &prepare_vhost_user_net_daemon)
-    }
-
-    #[cfg_attr(not(feature = "mmio"), test)]
-    fn test_vhost_user_net_tap() {
-        test_vhost_user_net(Some("vunet-tap0"), 2, &prepare_vhost_user_net_daemon)
-    }
-
-    #[cfg_attr(not(feature = "mmio"), test)]
-    fn test_vhost_user_net_multiple_queues() {
-        test_vhost_user_net(None, 4, &prepare_vhost_user_net_daemon)
-    }
-
-    #[cfg_attr(not(feature = "mmio"), test)]
-    fn test_vhost_user_net_tap_multiple_queues() {
-        test_vhost_user_net(Some("vunet-tap1"), 4, &prepare_vhost_user_net_daemon)
-    }
-
-    #[cfg_attr(not(feature = "mmio"), test)]
-    fn test_vhost_user_net_self_spawning() {
-        test_block!(tb, "", {
-            let mut clear = ClearDiskConfig::new();
-            let guest = Guest::new(&mut clear);
-
-            let mut cloud_child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=4"])
-                .args(&["--memory", "size=512M,file=/dev/shm"])
-                .args(&["--kernel", guest.fw_path.as_str()])
-                .default_disks()
-                .args(&[
-                    "--net",
-                    format!(
-                        "vhost_user=true,mac={},ip={},mask=255.255.255.0,num_queues=4,queue_size=1024",
-                        guest.network.guest_mac,
-                        guest.network.host_ip
+            // ACPI is not built with mmio, hence we can't test the resize
+            // feature for mmio.
+            #[cfg(not(feature = "mmio"))]
+            {
+                guest
+                    .ssh_command(
+                        "echo online | sudo tee /sys/devices/system/memory/auto_online_blocks",
                     )
-                    .as_str(),
-                ])
-                .spawn()
-                .unwrap();
+                    .unwrap_or_default();
 
-            thread::sleep(std::time::Duration::new(10, 0));
-            // 1 network interface + default localhost ==> 2 interfaces
-            aver_eq!(
-                tb,
-                guest
-                    .ssh_command("ip -o link | wc -l")
-                    .unwrap_or_default()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or_default(),
-                2
-            );
+                // Add RAM to the VM
+                let desired_ram = 1024 << 20;
+                resize_command(&api_socket, None, Some(desired_ram));
 
-            thread::sleep(std::time::Duration::new(10, 0));
+                thread::sleep(std::time::Duration::new(10, 0));
 
-            // The following pci devices will appear on guest with PCI-MSI
-            // interrupt vectors assigned.
-            // 1 virtio-console with 3 vectors: config, Rx, Tx
-            // 1 virtio-blk     with 2 vectors: config, Request
-            // 1 virtio-blk     with 2 vectors: config, Request
-            // 1 virtio-rng     with 2 vectors: config, Request
-            // Since virtio-net has 2 queue pairs, its vectors is as follows:
-            // 1 virtio-net     with 5 vectors: config, Rx (2), Tx (2)
-            // Based on the above, the total vectors should 14.
-            aver_eq!(
-                tb,
-                guest
-                    .ssh_command("grep -c PCI-MSI /proc/interrupts")
-                    .unwrap_or_default()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or_default(),
-                14
-            );
+                // Here by simply checking the size (through ssh), we validate
+                // the connection is still working, which means vhost-user-net
+                // keeps working after the resize.
+                aver!(tb, guest.get_total_memory().unwrap_or_default() > 982_000);
+            }
 
             let _ = cloud_child.kill();
             let _ = cloud_child.wait();
+
+            if let Some(mut daemon_child) = daemon_child {
+                thread::sleep(std::time::Duration::new(5, 0));
+                let _ = daemon_child.kill();
+                let _ = daemon_child.wait();
+            }
 
             Ok(())
         });
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
-    fn test_vhost_user_blk() {
+    #[test]
+    fn test_vhost_user_net_default() {
+        test_vhost_user_net(None, 2, Some(&prepare_vhost_user_net_daemon), false)
+    }
+
+    #[test]
+    fn test_vhost_user_net_tap() {
+        test_vhost_user_net(
+            Some("vunet-tap0"),
+            2,
+            Some(&prepare_vhost_user_net_daemon),
+            false,
+        )
+    }
+
+    #[test]
+    fn test_vhost_user_net_multiple_queues() {
+        test_vhost_user_net(None, 4, Some(&prepare_vhost_user_net_daemon), false)
+    }
+
+    #[test]
+    fn test_vhost_user_net_tap_multiple_queues() {
+        test_vhost_user_net(
+            Some("vunet-tap1"),
+            4,
+            Some(&prepare_vhost_user_net_daemon),
+            false,
+        )
+    }
+
+    #[test]
+    fn test_vhost_user_net_self_spawning() {
+        test_vhost_user_net(None, 4, None, true)
+    }
+
+    type PrepareBlkDaemon =
+        dyn Fn(&TempDir, &str, usize, bool, bool) -> (std::process::Child, String);
+
+    fn test_vhost_user_blk(
+        num_queues: usize,
+        readonly: bool,
+        direct: bool,
+        prepare_vhost_user_blk_daemon: Option<&PrepareBlkDaemon>,
+        self_spawned: bool,
+    ) {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
+            let api_socket = temp_api_path(&guest.tmp_dir);
 
-            let (mut daemon_child, vubd_socket_path) =
-                prepare_vubd(&guest.tmp_dir, "blk.img", 2, false, false);
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+
+            let mut kernel_path = workload_path.clone();
+            kernel_path.push("vmlinux");
+
+            let (blk_params, daemon_child) = if self_spawned {
+                let mut blk_file_path = workload_path;
+                blk_file_path.push("blk.img");
+                let blk_file_path = String::from(blk_file_path.to_str().unwrap());
+
+                (
+                    format!(
+                        "vhost_user=true,path={},num_queues={},queue_size=128,wce=true",
+                        blk_file_path, num_queues,
+                    ),
+                    None,
+                )
+            } else {
+                let prepare_daemon = prepare_vhost_user_blk_daemon.unwrap();
+                // Start the daemon
+                let (daemon_child, vubd_socket_path) =
+                    prepare_daemon(&guest.tmp_dir, "blk.img", num_queues, readonly, direct);
+
+                (
+                    format!(
+                        "vhost_user=true,socket={},num_queues={},queue_size=128,wce=true",
+                        vubd_socket_path, num_queues,
+                    ),
+                    Some(daemon_child),
+                )
+            };
 
             let mut cloud_child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=2"])
-                .args(&["--memory", "size=512M,file=/dev/shm"])
-                .args(&["--kernel", guest.fw_path.as_str()])
+                .args(&["--cpus", format!("boot={}", num_queues).as_str()])
+                .args(&["--memory", "size=512M,hotplug_size=2048M,file=/dev/shm"])
+                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .args(&[
                     "--disk",
                     format!(
@@ -1373,13 +1472,10 @@ mod tests {
                         guest.disk_config.disk(DiskType::CloudInit).unwrap()
                     )
                     .as_str(),
-                    format!(
-                        "vhost_user=true,socket={},num_queues=2,queue_size=128,wce=true",
-                        vubd_socket_path
-                    )
-                    .as_str(),
+                    blk_params.as_str(),
                 ])
                 .default_net()
+                .args(&["--api-socket", &api_socket])
                 .spawn()
                 .unwrap();
 
@@ -1397,8 +1493,20 @@ mod tests {
                 1
             );
 
-            thread::sleep(std::time::Duration::new(20, 0));
-            // Check if the queue number in /sys/block/vdc/mq is same to 2.
+            // Check if this block is RO or RW.
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep vdc | awk '{print $5}'")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                readonly as u32
+            );
+
+            // Check if the number of queues in /sys/block/vdc/mq matches the
+            // expected num_queues.
             aver_eq!(
                 tb,
                 guest
@@ -1407,12 +1515,19 @@ mod tests {
                     .trim()
                     .parse::<u32>()
                     .unwrap_or_default(),
-                2
+                num_queues as u32
             );
 
             // Mount the device
+            let mount_ro_rw_flag = if readonly { "ro,noload" } else { "rw" };
             guest.ssh_command("mkdir mount_image")?;
-            guest.ssh_command("sudo mount -t ext4 /dev/vdc mount_image/")?;
+            guest.ssh_command(
+                format!(
+                    "sudo mount -o {} -t ext4 /dev/vdc mount_image/",
+                    mount_ro_rw_flag
+                )
+                .as_str(),
+            )?;
 
             // Check the content of the block device. The file "foo" should
             // contain "bar".
@@ -1425,6 +1540,36 @@ mod tests {
                 "bar"
             );
 
+            // ACPI is not built with mmio, hence we can't test the resize
+            // feature for mmio.
+            #[cfg(not(feature = "mmio"))]
+            {
+                guest
+                    .ssh_command(
+                        "echo online | sudo tee /sys/devices/system/memory/auto_online_blocks",
+                    )
+                    .unwrap_or_default();
+
+                // Add RAM to the VM
+                let desired_ram = 1024 << 20;
+                resize_command(&api_socket, None, Some(desired_ram));
+
+                thread::sleep(std::time::Duration::new(10, 0));
+
+                aver!(tb, guest.get_total_memory().unwrap_or_default() > 982_000);
+
+                // Check again the content of the block device after the resize
+                // has been performed.
+                aver_eq!(
+                    tb,
+                    guest
+                        .ssh_command("cat mount_image/foo")
+                        .unwrap_or_default()
+                        .trim(),
+                    "bar"
+                );
+            }
+
             // Unmount the device
             guest.ssh_command("sudo umount /dev/vdc")?;
             guest.ssh_command("rm -r mount_image")?;
@@ -1432,233 +1577,97 @@ mod tests {
             let _ = cloud_child.kill();
             let _ = cloud_child.wait();
 
-            thread::sleep(std::time::Duration::new(5, 0));
-            let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
+            if let Some(mut daemon_child) = daemon_child {
+                thread::sleep(std::time::Duration::new(5, 0));
+                let _ = daemon_child.kill();
+                let _ = daemon_child.wait();
+            }
 
             Ok(())
         });
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
+    fn test_vhost_user_blk_default() {
+        test_vhost_user_blk(2, false, false, Some(&prepare_vubd), false)
+    }
+
+    #[test]
     fn test_vhost_user_blk_self_spawning() {
-        test_block!(tb, "", {
-            let mut clear = ClearDiskConfig::new();
-            let guest = Guest::new(&mut clear);
-
-            let mut cloud_child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=2"])
-                .args(&["--memory", "size=512M,file=/dev/shm"])
-                .args(&["--kernel", guest.fw_path.as_str()])
-                .args(&[
-                    "--disk",
-                    format!(
-                        "path={},vhost_user=true",
-                        guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
-                    )
-                    .as_str(),
-                    format!(
-                        "path={},vhost_user=true",
-                        guest.disk_config.disk(DiskType::CloudInit).unwrap()
-                    )
-                    .as_str(),
-                ])
-                .default_net()
-                .spawn()
-                .unwrap();
-
-            thread::sleep(std::time::Duration::new(20, 0));
-
-            let reboot_count = guest
-                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
-                .unwrap_or_default()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(1);
-
-            aver_eq!(tb, reboot_count, 0);
-            guest.ssh_command("sudo reboot").unwrap_or_default();
-
-            thread::sleep(std::time::Duration::new(20, 0));
-            let reboot_count = guest
-                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
-                .unwrap_or_default()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or_default();
-            aver_eq!(tb, reboot_count, 1);
-
-            let _ = cloud_child.kill();
-            let _ = cloud_child.wait();
-
-            Ok(())
-        });
+        test_vhost_user_blk(1, false, false, None, true)
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
     fn test_vhost_user_blk_readonly() {
-        test_block!(tb, "", {
-            let mut clear = ClearDiskConfig::new();
-            let guest = Guest::new(&mut clear);
-
-            let (mut daemon_child, vubd_socket_path) =
-                prepare_vubd(&guest.tmp_dir, "blk.img", 1, true, false);
-
-            let mut cloud_child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=1"])
-                .args(&["--memory", "size=512M,file=/dev/shm"])
-                .args(&["--kernel", guest.fw_path.as_str()])
-                .args(&[
-                    "--disk",
-                    format!(
-                        "path={}",
-                        guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
-                    )
-                    .as_str(),
-                    format!(
-                        "path={}",
-                        guest.disk_config.disk(DiskType::CloudInit).unwrap()
-                    )
-                    .as_str(),
-                    format!(
-                        "vhost_user=true,socket={},num_queues=1,queue_size=128,wce=true",
-                        vubd_socket_path
-                    )
-                    .as_str(),
-                ])
-                .default_net()
-                .spawn()
-                .unwrap();
-
-            thread::sleep(std::time::Duration::new(20, 0));
-
-            // Check both if /dev/vdc exists and if the block size is 16M.
-            aver_eq!(
-                tb,
-                guest
-                    .ssh_command("lsblk | grep vdc | grep -c 16M")
-                    .unwrap_or_default()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or_default(),
-                1
-            );
-
-            // Check both if /dev/vdc exists and if this block is RO.
-            aver_eq!(
-                tb,
-                guest
-                    .ssh_command("lsblk | grep vdc | awk '{print $5}'")
-                    .unwrap_or_default()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or_default(),
-                1
-            );
-
-            let _ = cloud_child.kill();
-            let _ = cloud_child.wait();
-
-            thread::sleep(std::time::Duration::new(5, 0));
-            let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
-
-            Ok(())
-        });
+        test_vhost_user_blk(1, true, false, Some(&prepare_vubd), false)
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
+    #[test]
     fn test_vhost_user_blk_direct() {
-        test_block!(tb, "", {
-            let mut clear = ClearDiskConfig::new();
-            let guest = Guest::new(&mut clear);
-
-            let (mut daemon_child, vubd_socket_path) =
-                prepare_vubd(&guest.tmp_dir, "blk.img", 1, false, true);
-
-            let mut cloud_child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=1"])
-                .args(&["--memory", "size=512M,file=/dev/shm"])
-                .args(&["--kernel", guest.fw_path.as_str()])
-                .args(&[
-                    "--disk",
-                    format!(
-                        "path={}",
-                        guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
-                    )
-                    .as_str(),
-                    format!(
-                        "path={}",
-                        guest.disk_config.disk(DiskType::CloudInit).unwrap()
-                    )
-                    .as_str(),
-                    format!(
-                        "vhost_user=true,socket={},num_queues=1,queue_size=128,wce=true",
-                        vubd_socket_path
-                    )
-                    .as_str(),
-                ])
-                .default_net()
-                .spawn()
-                .unwrap();
-
-            thread::sleep(std::time::Duration::new(20, 0));
-
-            // Check both if /dev/vdc exists and if the block size is 16M.
-            aver_eq!(
-                tb,
-                guest
-                    .ssh_command("lsblk | grep vdc | grep -c 16M")
-                    .unwrap_or_default()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or_default(),
-                1
-            );
-
-            let _ = cloud_child.kill();
-            let _ = cloud_child.wait();
-
-            thread::sleep(std::time::Duration::new(5, 0));
-            let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
-
-            Ok(())
-        });
+        test_vhost_user_blk(1, false, true, Some(&prepare_vubd), false)
     }
 
-    #[cfg_attr(not(feature = "mmio"), test)]
-    fn test_boot_from_vhost_user_blk() {
+    fn test_boot_from_vhost_user_blk(
+        num_queues: usize,
+        readonly: bool,
+        direct: bool,
+        prepare_vhost_user_blk_daemon: Option<&PrepareBlkDaemon>,
+        self_spawned: bool,
+    ) {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
 
-            let (mut daemon_child, vubd_socket_path) = prepare_vubd(
-                &guest.tmp_dir,
-                guest
-                    .disk_config
-                    .disk(DiskType::RawOperatingSystem)
-                    .unwrap()
-                    .as_str(),
-                1,
-                false,
-                false,
-            );
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+
+            let mut kernel_path = workload_path;
+            kernel_path.push("vmlinux");
+
+            let disk_path = guest
+                .disk_config
+                .disk(DiskType::RawOperatingSystem)
+                .unwrap();
+
+            let (blk_boot_params, daemon_child) = if self_spawned {
+                (
+                    format!(
+                        "vhost_user=true,path={},num_queues={},queue_size=128,wce=true",
+                        disk_path, num_queues,
+                    ),
+                    None,
+                )
+            } else {
+                let prepare_daemon = prepare_vhost_user_blk_daemon.unwrap();
+                // Start the daemon
+                let (daemon_child, vubd_socket_path) = prepare_daemon(
+                    &guest.tmp_dir,
+                    disk_path.as_str(),
+                    num_queues,
+                    readonly,
+                    direct,
+                );
+
+                (
+                    format!(
+                        "vhost_user=true,socket={},num_queues={},queue_size=128,wce=true",
+                        vubd_socket_path, num_queues,
+                    ),
+                    Some(daemon_child),
+                )
+            };
 
             let mut cloud_child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=1"])
+                .args(&["--cpus", format!("boot={}", num_queues).as_str()])
                 .args(&["--memory", "size=512M,file=/dev/shm"])
-                .args(&["--kernel", guest.fw_path.as_str()])
+                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .args(&[
                     "--disk",
+                    blk_boot_params.as_str(),
                     format!(
                         "path={}",
                         guest.disk_config.disk(DiskType::CloudInit).unwrap()
-                    )
-                    .as_str(),
-                    format!(
-                        "vhost_user=true,socket={},num_queues=1,queue_size=128,wce=true",
-                        vubd_socket_path
                     )
                     .as_str(),
                 ])
@@ -1669,18 +1678,59 @@ mod tests {
             thread::sleep(std::time::Duration::new(20, 0));
 
             // Just check the VM booted correctly.
-            aver_eq!(tb, guest.get_cpu_count().unwrap_or_default(), 1);
+            aver_eq!(
+                tb,
+                guest.get_cpu_count().unwrap_or_default(),
+                num_queues as u32
+            );
             aver!(tb, guest.get_total_memory().unwrap_or_default() > 491_000);
+
+            if self_spawned {
+                // The reboot is not supported with mmio, so no reason to test it.
+                #[cfg(not(feature = "mmio"))]
+                {
+                    let reboot_count = guest
+                        .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                        .unwrap_or_default()
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or(1);
+
+                    aver_eq!(tb, reboot_count, 0);
+                    guest.ssh_command("sudo reboot").unwrap_or_default();
+
+                    thread::sleep(std::time::Duration::new(20, 0));
+                    let reboot_count = guest
+                        .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                        .unwrap_or_default()
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or_default();
+                    aver_eq!(tb, reboot_count, 1);
+                }
+            }
 
             let _ = cloud_child.kill();
             let _ = cloud_child.wait();
 
-            thread::sleep(std::time::Duration::new(5, 0));
-            let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
+            if let Some(mut daemon_child) = daemon_child {
+                thread::sleep(std::time::Duration::new(5, 0));
+                let _ = daemon_child.kill();
+                let _ = daemon_child.wait();
+            }
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_boot_from_vhost_user_blk_default() {
+        test_boot_from_vhost_user_blk(1, false, false, Some(&prepare_vubd), false)
+    }
+
+    #[test]
+    fn test_boot_from_vhost_user_blk_self_spawning() {
+        test_boot_from_vhost_user_blk(1, false, false, None, true)
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -1732,10 +1782,12 @@ mod tests {
         cache_size: Option<u64>,
         virtiofsd_cache: &str,
         prepare_daemon: &dyn Fn(&TempDir, &str, &str) -> (std::process::Child, String),
+        hotplug: bool,
     ) {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
+            let api_socket = temp_api_path(&guest.tmp_dir);
 
             let mut workload_path = dirs::home_dir().unwrap();
             workload_path.push("workloads");
@@ -1759,32 +1811,35 @@ mod tests {
                 virtiofsd_cache,
             );
 
-            let mut child = GuestCommand::new(&guest)
+            let mut guest_command = GuestCommand::new(&guest);
+            guest_command
                 .args(&["--cpus", "boot=1"])
-                .args(&["--memory", "size=512M,file=/dev/shm"])
+                .args(&["--memory", "size=512M,hotplug_size=2048M,file=/dev/shm"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&[
-                    "--fs",
-                    format!(
-                        "tag=myfs,sock={},num_queues=1,queue_size=1024,dax={}{}",
-                        virtiofsd_socket_path, dax_vmm_param, cache_size_vmm_param
-                    )
-                    .as_str(),
-                ])
-                .args(&[
-                    "--cmdline",
-                    "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c \
-                     console=tty0 console=ttyS0,115200n8 console=hvc0 quiet \
-                     init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable \
-                     no_timer_check noreplace-smp cryptomgr.notests \
-                     rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw",
-                ])
-                .spawn()
-                .unwrap();
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
+                .args(&["--api-socket", &api_socket]);
+
+            let fs_params = format!(
+                "tag=myfs,sock={},num_queues=1,queue_size=1024,dax={}{}",
+                virtiofsd_socket_path, dax_vmm_param, cache_size_vmm_param
+            );
+
+            if !hotplug {
+                guest_command.args(&["--fs", fs_params.as_str()]);
+            }
+
+            let mut child = guest_command.spawn().unwrap();
 
             thread::sleep(std::time::Duration::new(20, 0));
+
+            if hotplug {
+                // Add fs to the VM
+                aver!(tb, remote_command(&api_socket, "add-fs", Some(&fs_params),));
+
+                thread::sleep(std::time::Duration::new(10, 0));
+            }
 
             // Mount shared directory through virtio_fs filesystem
             let mount_cmd = format!(
@@ -1837,6 +1892,35 @@ mod tests {
                 "bar"
             );
 
+            // ACPI is not built with mmio, hence we can't test the resize
+            // feature for mmio.
+            #[cfg(not(feature = "mmio"))]
+            {
+                guest
+                    .ssh_command(
+                        "echo online | sudo tee /sys/devices/system/memory/auto_online_blocks",
+                    )
+                    .unwrap_or_default();
+
+                // Add RAM to the VM
+                let desired_ram = 1024 << 20;
+                resize_command(&api_socket, None, Some(desired_ram));
+
+                thread::sleep(std::time::Duration::new(10, 0));
+                aver!(tb, guest.get_total_memory().unwrap_or_default() > 982_000);
+
+                // After the resize, check again that file1 exists and its
+                // content is "foo".
+                aver_eq!(
+                    tb,
+                    guest
+                        .ssh_command("cat mount_dir/file1")
+                        .unwrap_or_default()
+                        .trim(),
+                    "foo"
+                );
+            }
+
             let _ = child.kill();
             let _ = daemon_child.kill();
             let _ = child.wait();
@@ -1847,22 +1931,22 @@ mod tests {
 
     #[test]
     fn test_virtio_fs_dax_on_default_cache_size() {
-        test_virtio_fs(true, None, "none", &prepare_virtiofsd)
+        test_virtio_fs(true, None, "none", &prepare_virtiofsd, false)
     }
 
     #[test]
     fn test_virtio_fs_dax_on_cache_size_1_gib() {
-        test_virtio_fs(true, Some(0x4000_0000), "none", &prepare_virtiofsd)
+        test_virtio_fs(true, Some(0x4000_0000), "none", &prepare_virtiofsd, false)
     }
 
     #[test]
     fn test_virtio_fs_dax_off() {
-        test_virtio_fs(false, None, "none", &prepare_virtiofsd)
+        test_virtio_fs(false, None, "none", &prepare_virtiofsd, false)
     }
 
     #[test]
     fn test_virtio_fs_dax_on_default_cache_size_w_vhost_user_fs_daemon() {
-        test_virtio_fs(true, None, "none", &prepare_vhost_user_fs_daemon)
+        test_virtio_fs(true, None, "none", &prepare_vhost_user_fs_daemon, false)
     }
 
     #[test]
@@ -1872,16 +1956,46 @@ mod tests {
             Some(0x4000_0000),
             "none",
             &prepare_vhost_user_fs_daemon,
+            false,
         )
     }
 
     #[test]
     fn test_virtio_fs_dax_off_w_vhost_user_fs_daemon() {
-        test_virtio_fs(false, None, "none", &prepare_vhost_user_fs_daemon)
+        test_virtio_fs(false, None, "none", &prepare_vhost_user_fs_daemon, false)
     }
 
-    #[test]
-    fn test_virtio_pmem() {
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_hotplug_dax_on() {
+        test_virtio_fs(true, None, "none", &prepare_virtiofsd, true)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_hotplug_dax_off() {
+        test_virtio_fs(false, None, "none", &prepare_virtiofsd, true)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_hotplug_dax_on_w_vhost_user_fs_daemon() {
+        test_virtio_fs(true, None, "none", &prepare_vhost_user_fs_daemon, true)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_fs_hotplug_dax_off_w_vhost_user_fs_daemon() {
+        test_virtio_fs(false, None, "none", &prepare_vhost_user_fs_daemon, true)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_pmem_persist_writes() {
+        test_virtio_pmem(false)
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_pmem_discard_writes() {
+        test_virtio_pmem(true)
+    }
+
+    fn test_virtio_pmem(discard_writes: bool) {
         test_block!(tb, "", {
             let mut clear = ClearDiskConfig::new();
             let guest = Guest::new(&mut clear);
@@ -1889,25 +2003,34 @@ mod tests {
             let mut workload_path = dirs::home_dir().unwrap();
             workload_path.push("workloads");
 
-            let mut kernel_path = workload_path;
-            kernel_path.push("vmlinux");
+            let mut pmem_temp_file = NamedTempFile::new().unwrap();
+            pmem_temp_file.as_file_mut().set_len(128 << 20).unwrap();
+
+            std::process::Command::new("mkfs.ext4")
+                .arg(pmem_temp_file.path())
+                .output()
+                .expect("Expect creating disk image to succeed");
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus","boot=1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
-                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .args(&["--kernel", &guest.fw_path])
                 .default_disks()
                 .default_net()
                 .args(&[
                     "--pmem",
                     format!(
-                        "file={},size={}",
-                        guest.disk_config.disk(DiskType::RawOperatingSystem).unwrap(),
-                        fs::metadata(&guest.disk_config.disk(DiskType::RawOperatingSystem).unwrap()).unwrap().len()
+                        "file={},size={}{}",
+                        pmem_temp_file.path().to_str().unwrap(),
+                        "128M",
+                        if discard_writes {
+                            ",discard_writes=on"
+                        } else {
+                            ""
+                        }
                     )
                     .as_str(),
                 ])
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
                 .spawn()
                 .unwrap();
 
@@ -1921,6 +2044,42 @@ mod tests {
                     .unwrap_or_default()
                     .trim(),
                 "/dev/pmem0"
+            );
+
+            // Check changes persist after reboot
+            aver_eq!(
+                tb,
+                guest.ssh_command("sudo mount /dev/pmem0 /mnt").unwrap(),
+                ""
+            );
+            aver_eq!(tb, guest.ssh_command("ls /mnt").unwrap(), "lost+found\n");
+            guest
+                .ssh_command("echo test123 | sudo tee /mnt/test")
+                .unwrap();
+            aver_eq!(tb, guest.ssh_command("sudo umount /mnt").unwrap(), "");
+            aver_eq!(tb, guest.ssh_command("ls /mnt").unwrap(), "");
+
+            guest.ssh_command("sudo reboot").unwrap();
+            thread::sleep(std::time::Duration::new(30, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 1);
+            aver_eq!(
+                tb,
+                guest.ssh_command("sudo mount /dev/pmem0 /mnt").unwrap(),
+                ""
+            );
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("sudo cat /mnt/test")
+                    .unwrap_or_default()
+                    .trim(),
+                if discard_writes { "" } else { "test123" }
             );
 
             let _ = child.kill();
@@ -1942,26 +2101,38 @@ mod tests {
             kernel_path.push("vmlinux");
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus","boot=1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
-                .args(&["--disk",
+                .args(&[
+                    "--disk",
                     format!(
                         "path={}",
                         guest.disk_config.disk(DiskType::CloudInit).unwrap()
                     )
-                    .as_str()])
+                    .as_str(),
+                ])
                 .default_net()
                 .args(&[
                     "--pmem",
                     format!(
                         "file={},size={}",
-                        guest.disk_config.disk(DiskType::RawOperatingSystem).unwrap(),
-                        fs::metadata(&guest.disk_config.disk(DiskType::RawOperatingSystem).unwrap()).unwrap().len()
+                        guest
+                            .disk_config
+                            .disk(DiskType::RawOperatingSystem)
+                            .unwrap(),
+                        fs::metadata(
+                            &guest
+                                .disk_config
+                                .disk(DiskType::RawOperatingSystem)
+                                .unwrap()
+                        )
+                        .unwrap()
+                        .len()
                     )
                     .as_str(),
                 ])
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .spawn()
                 .unwrap();
 
@@ -2320,26 +2491,33 @@ mod tests {
 
             let mut child = GuestCommand::new(&guest)
                 .args(&["--cpus", "boot=4"])
-                .args(&["--memory", "size=1G,file=/dev/hugepages"])
+                .args(&["--memory", "size=2G,file=/dev/hugepages"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 vfio_iommu_type1.allow_unsafe_interrupts rw"])
+                .args(&[
+                    "--cmdline",
+                    format!(
+                        "{} vfio_iommu_type1.allow_unsafe_interrupts",
+                        CLEAR_KERNEL_CMDLINE
+                    )
+                    .as_str(),
+                ])
                 .args(&[
                     "--net",
+                    format!("tap={},mac={}", vfio_tap0, guest.network.guest_mac).as_str(),
                     format!(
-                        "tap={},mac={}", vfio_tap0, guest.network.guest_mac
+                        "tap={},mac={},iommu=on",
+                        vfio_tap1, guest.network.l2_guest_mac1
                     )
                     .as_str(),
                     format!(
-                        "tap={},mac={},iommu=on", vfio_tap1, guest.network.l2_guest_mac1
+                        "tap={},mac={},iommu=on",
+                        vfio_tap2, guest.network.l2_guest_mac2
                     )
                     .as_str(),
                     format!(
-                        "tap={},mac={},iommu=on", vfio_tap2, guest.network.l2_guest_mac2
-                    )
-                    .as_str(),
-                    format!(
-                        "tap={},mac={},iommu=on", vfio_tap3, guest.network.l2_guest_mac3
+                        "tap={},mac={},iommu=on",
+                        vfio_tap3, guest.network.l2_guest_mac3
                     )
                     .as_str(),
                 ])
@@ -2465,6 +2643,27 @@ mod tests {
                 7,
             );
 
+            // Perform memory hotplug in L2 and validate the memory is showing
+            // up as expected. In order to check, we will use the virtio-net
+            // device already passed through L2 as a VFIO device, this will
+            // verify that VFIO devices are functional with memory hotplug.
+            aver!(
+                tb,
+                guest.get_total_memory_l2().unwrap_or_default() > 491_000
+            );
+            guest.ssh_command_l2_1(
+                "sudo bash -c 'echo online > /sys/devices/system/memory/auto_online_blocks'",
+            )?;
+            guest.ssh_command_l1(
+                "sudo /mnt/ch-remote \
+                 --api-socket=/tmp/ch_api.sock \
+                 resize --memory=1073741824",
+            )?;
+            aver!(
+                tb,
+                guest.get_total_memory_l2().unwrap_or_default() > 982_000
+            );
+
             let _ = child.kill();
             let _ = daemon_child.kill();
             let _ = child.wait();
@@ -2486,12 +2685,15 @@ mod tests {
             kernel_path.push("vmlinux");
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus","boot=1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw acpi=off"])
+                .args(&[
+                    "--cmdline",
+                    format!("{} acpi=off", CLEAR_KERNEL_CMDLINE).as_str(),
+                ])
                 .spawn()
                 .unwrap();
 
@@ -2590,12 +2792,12 @@ mod tests {
             kernel_path.push("bzImage");
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus","boot=1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .spawn()
                 .unwrap();
 
@@ -2851,7 +3053,7 @@ mod tests {
             kernel_path.push("bzImage");
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus","boot=1"])
+                .args(&["--cpus", "boot=1"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .args(&[
@@ -2868,7 +3070,7 @@ mod tests {
                     .as_str(),
                 ])
                 .args(&["--net", guest.default_net_string_w_iommu().as_str()])
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .spawn()
                 .unwrap();
 
@@ -3120,7 +3322,7 @@ mod tests {
                 .args(&["--cpus", "boot=2,max=4"])
                 .args(&["--memory", "size=512M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .default_disks()
                 .default_net()
                 .args(&["--api-socket", &api_socket])
@@ -3201,7 +3403,7 @@ mod tests {
                 .args(&["--cpus", "boot=2,max=4"])
                 .args(&["--memory", "size=512M,hotplug_size=8192M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .default_disks()
                 .default_net()
                 .args(&["--api-socket", &api_socket])
@@ -3279,6 +3481,64 @@ mod tests {
         });
     }
 
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_virtio_mem() {
+        test_block!(tb, "", {
+            let mut clear = ClearDiskConfig::new();
+            let guest = Guest::new(&mut clear);
+            let api_socket = temp_api_path(&guest.tmp_dir);
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+            let mut kernel_path = workload_path;
+            kernel_path.push("vmlinux");
+
+            let mut child = GuestCommand::new(&guest)
+                .args(&["--cpus", "boot=2,max=4"])
+                .args(&["--memory", "size=512M,hotplug_method=virtio-mem,hotplug_size=8192M"])
+                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .default_disks()
+                .default_net()
+                .args(&["--api-socket", &api_socket])
+                .spawn()
+                .unwrap();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            aver!(tb, guest.get_total_memory().unwrap_or_default() > 491_000);
+
+            guest
+                .ssh_command("echo online | sudo tee /sys/devices/system/memory/auto_online_blocks")
+                .unwrap_or_default();
+
+            // Add RAM to the VM
+            let desired_ram = 1024 << 20;
+            resize_command(&api_socket, None, Some(desired_ram));
+
+            thread::sleep(std::time::Duration::new(10, 0));
+            aver!(tb, guest.get_total_memory().unwrap_or_default() > 982_000);
+
+            // Add RAM to the VM
+            let desired_ram = 2048 << 20;
+            resize_command(&api_socket, None, Some(desired_ram));
+
+            thread::sleep(std::time::Duration::new(10, 0));
+            aver!(tb, guest.get_total_memory().unwrap_or_default() > 1_964_000);
+
+            // Remove RAM to the VM
+            let desired_ram = 1024 << 20;
+            resize_command(&api_socket, None, Some(desired_ram));
+
+            thread::sleep(std::time::Duration::new(10, 0));
+            aver!(tb, guest.get_total_memory().unwrap_or_default() > 982_000);
+            aver!(tb, guest.get_total_memory().unwrap_or_default() < 1_964_000);
+
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(())
+        });
+    }
+
     // Test both vCPU and memory resizing together
     #[cfg_attr(not(feature = "mmio"), test)]
     fn test_resize() {
@@ -3295,7 +3555,7 @@ mod tests {
                 .args(&["--cpus", "boot=2,max=4"])
                 .args(&["--memory", "size=512M,hotplug_size=8192M"])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .default_disks()
                 .default_net()
                 .args(&["--api-socket", &api_socket])
@@ -3381,12 +3641,15 @@ mod tests {
             let guest_memory_size_kb = 512 * 1024;
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus","boot=1"])
-                .args(&["--memory", format!("size={}K", guest_memory_size_kb).as_str()])
+                .args(&["--cpus", "boot=1"])
+                .args(&[
+                    "--memory",
+                    format!("size={}K", guest_memory_size_kb).as_str(),
+                ])
                 .args(&["--kernel", kernel_path.to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--cmdline", "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c console=tty0 console=ttyS0,115200n8 console=hvc0 quiet init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable no_timer_check noreplace-smp cryptomgr.notests rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw"])
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
                 .spawn()
                 .unwrap();
 
@@ -3399,6 +3662,515 @@ mod tests {
 
             let _ = child.kill();
             let _ = child.wait();
+            Ok(())
+        });
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_disk_hotplug() {
+        test_block!(tb, "", {
+            let mut clear = ClearDiskConfig::new();
+            let guest = Guest::new(&mut clear);
+
+            let api_socket = temp_api_path(&guest.tmp_dir);
+
+            let mut child = GuestCommand::new(&guest)
+                .args(&["--api-socket", &api_socket])
+                .args(&["--cpus", "boot=1"])
+                .args(&["--memory", "size=512M"])
+                .args(&["--kernel", guest.fw_path.as_str()])
+                .default_disks()
+                .default_net()
+                .spawn()
+                .unwrap();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Check /dev/vdc is not there
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+
+            let mut blk_file_path = dirs::home_dir().unwrap();
+            blk_file_path.push("workloads");
+            blk_file_path.push("blk.img");
+            aver!(
+                tb,
+                remote_command(
+                    &api_socket,
+                    "add-disk",
+                    Some(&format!(
+                        "path={},id=test0",
+                        blk_file_path.to_str().unwrap()
+                    ))
+                )
+            );
+
+            // Check that if /dev/vdc exists and the block size is 16M.
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            guest.ssh_command("sudo reboot").unwrap_or_default();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 1);
+
+            // Check still there after reboot
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            aver!(
+                tb,
+                remote_command(&api_socket, "remove-device", Some("test0"))
+            );
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Check device has gone away
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+
+            guest.ssh_command("sudo reboot").unwrap_or_default();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 2);
+
+            // Check device still absent
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(())
+        });
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_pmem_hotplug() {
+        test_block!(tb, "", {
+            let mut clear = ClearDiskConfig::new();
+            let guest = Guest::new(&mut clear);
+
+            let api_socket = temp_api_path(&guest.tmp_dir);
+
+            let mut child = GuestCommand::new(&guest)
+                .args(&["--api-socket", &api_socket])
+                .args(&["--cpus", "boot=1"])
+                .args(&["--memory", "size=512M"])
+                .args(&["--kernel", guest.fw_path.as_str()])
+                .default_disks()
+                .default_net()
+                .spawn()
+                .unwrap();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Check /dev/pmem0 is not there
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep -c pmem0")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+
+            let mut pmem_temp_file = NamedTempFile::new().unwrap();
+            pmem_temp_file.as_file_mut().set_len(128 << 20).unwrap();
+            aver!(
+                tb,
+                remote_command(
+                    &api_socket,
+                    "add-pmem",
+                    Some(&format!(
+                        "file={},size=128M,id=test0",
+                        pmem_temp_file.path().to_str().unwrap()
+                    ))
+                )
+            );
+
+            // Check that /dev/pmem0 exists and the block size is 128M
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep pmem0 | grep -c 128M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            guest.ssh_command("sudo reboot").unwrap_or_default();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 1);
+
+            // Check still there after reboot
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep pmem0 | grep -c 128M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            aver!(
+                tb,
+                remote_command(&api_socket, "remove-device", Some("test0"))
+            );
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Check device has gone away
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep pmem0 | grep -c 128M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+
+            guest.ssh_command("sudo reboot").unwrap_or_default();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 2);
+
+            // Check still absent after reboot
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("lsblk | grep pmem0 | grep -c 128M")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(())
+        });
+    }
+
+    #[cfg_attr(not(feature = "mmio"), test)]
+    fn test_net_hotplug() {
+        test_block!(tb, "", {
+            let mut clear = ClearDiskConfig::new();
+            let guest = Guest::new(&mut clear);
+
+            let api_socket = temp_api_path(&guest.tmp_dir);
+
+            // Boot without network
+            let mut child = GuestCommand::new(&guest)
+                .args(&["--api-socket", &api_socket])
+                .args(&["--cpus", "boot=1"])
+                .args(&["--memory", "size=512M"])
+                .args(&["--kernel", guest.fw_path.as_str()])
+                .default_disks()
+                .spawn()
+                .unwrap();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Add network
+            aver!(
+                tb,
+                remote_command(
+                    &api_socket,
+                    "add-net",
+                    Some(guest.default_net_string().as_str())
+                )
+            );
+
+            // 1 network interfaces + default localhost ==> 2 interfaces
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("ip -o link | wc -l")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                2
+            );
+
+            guest.ssh_command("sudo reboot").unwrap_or_default();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+            let reboot_count = guest
+                .ssh_command("sudo journalctl | grep -c -- \"-- Reboot --\"")
+                .unwrap_or_default()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            aver_eq!(tb, reboot_count, 1);
+
+            // Check still there after reboot
+            // 1 network interfaces + default localhost ==> 2 interfaces
+            aver_eq!(
+                tb,
+                guest
+                    .ssh_command("ip -o link | wc -l")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                2
+            );
+
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_initramfs() {
+        test_block!(tb, "", {
+            let mut clear = ClearDiskConfig::new();
+            let guest = Guest::new(&mut clear);
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+
+            let mut kernel_path = workload_path.clone();
+            kernel_path.push("vmlinux");
+
+            let mut pvh_kernel_path = workload_path.clone();
+            pvh_kernel_path.push("vmlinux.pvh");
+
+            let mut initramfs_path = workload_path;
+            initramfs_path.push("alpine_initramfs.img");
+
+            let test_string = String::from("axz34i9rylotd8n50wbv6kcj7f2qushme1pg");
+            let cmdline = format!("console=hvc0 quiet TEST_STRING={}", test_string);
+
+            vec![kernel_path, pvh_kernel_path]
+                .iter()
+                .for_each(|k_path| {
+                    let mut child = GuestCommand::new(&guest)
+                        .args(&["--kernel", k_path.to_str().unwrap()])
+                        .args(&["--initramfs", initramfs_path.to_str().unwrap()])
+                        .args(&["--cmdline", &cmdline])
+                        .capture_output()
+                        .spawn()
+                        .unwrap();
+
+                    thread::sleep(std::time::Duration::new(20, 0));
+
+                    let _ = child.kill();
+                    match child.wait_with_output() {
+                        Ok(out) => {
+                            let s = String::from_utf8_lossy(&out.stdout);
+                            aver_ne!(tb, s.lines().position(|line| line == test_string), None);
+                        }
+                        Err(_) => aver!(tb, false),
+                    }
+                });
+            Ok(())
+        });
+    }
+
+    // One thing to note about this test. The virtio-net device is heavily used
+    // through each ssh command. There's no need to perform a dedicated test to
+    // verify the migration went well for virtio-net.
+    #[ignore]
+    #[cfg_attr(feature = "mmio", test)]
+    fn test_snapshot_restore() {
+        test_block!(tb, "", {
+            let mut clear = ClearDiskConfig::new();
+            let guest = Guest::new(&mut clear);
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+
+            let mut kernel_path = workload_path;
+            kernel_path.push("bzImage");
+
+            let api_socket = temp_api_path(&guest.tmp_dir);
+
+            let mut child = GuestCommand::new(&guest)
+                .args(&["--api-socket", &api_socket])
+                .args(&["--cpus", "boot=4"])
+                .args(&["--memory", "size=4G"])
+                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .default_disks()
+                .default_net()
+                .args(&["--cmdline", CLEAR_KERNEL_CMDLINE])
+                .capture_output()
+                .spawn()
+                .unwrap();
+
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Check the number of vCPUs
+            aver_eq!(tb, guest.get_cpu_count().unwrap_or_default(), 4);
+            // Check the guest RAM
+            aver!(tb, guest.get_total_memory().unwrap_or_default() > 3_968_000);
+            // Check if the block device is readable
+            aver!(
+                tb,
+                guest
+                    .ssh_command("dd if=/dev/vda of=/dev/null bs=1M iflag=direct count=1024")
+                    .is_ok()
+            );
+            // Check if the rng device is readable
+            aver!(
+                tb,
+                guest
+                    .ssh_command("head -c 1000 /dev/hwrng > /dev/null")
+                    .is_ok()
+            );
+            // Check if the console is usable
+            let console_text = String::from("On a branch floating down river a cricket, singing.");
+            let console_cmd = format!("echo {} | sudo tee /dev/hvc0", console_text);
+            aver!(tb, guest.ssh_command(&console_cmd).is_ok());
+
+            // Pause the VM
+            aver!(tb, remote_command(&api_socket, "pause", None));
+
+            // Create the snapshot directory
+            let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+            // Take a snapshot from the VM
+            aver!(
+                tb,
+                remote_command(
+                    &api_socket,
+                    "snapshot",
+                    Some(format!("file://{}", snapshot_dir).as_str()),
+                )
+            );
+
+            // Wait to make sure the snapshot is completed
+            thread::sleep(std::time::Duration::new(10, 0));
+
+            // Shutdown the source VM and check console output
+            let _ = child.kill();
+            match child.wait_with_output() {
+                Ok(out) => {
+                    aver!(
+                        tb,
+                        String::from_utf8_lossy(&out.stdout).contains(&console_text)
+                    );
+                }
+                Err(_) => aver!(tb, false),
+            }
+
+            // Restore the VM from the snapshot
+            let mut child = GuestCommand::new(&guest)
+                .args(&["--api-socket", &api_socket])
+                .args(&[
+                    "--restore",
+                    format!("source_url=file://{}", snapshot_dir).as_str(),
+                ])
+                .capture_output()
+                .spawn()
+                .unwrap();
+
+            // Wait for the VM to be restored
+            thread::sleep(std::time::Duration::new(10, 0));
+
+            // Perform same checks to validate VM has been properly restored
+            aver_eq!(tb, guest.get_cpu_count().unwrap_or_default(), 4);
+            aver!(tb, guest.get_total_memory().unwrap_or_default() > 3_968_000);
+            aver!(
+                tb,
+                guest
+                    .ssh_command("dd if=/dev/vda of=/dev/null bs=1M iflag=direct count=1024")
+                    .is_ok()
+            );
+            aver!(
+                tb,
+                guest
+                    .ssh_command("head -c 1000 /dev/hwrng > /dev/null")
+                    .is_ok()
+            );
+            aver!(tb, guest.ssh_command(&console_cmd).is_ok());
+
+            // Shutdown the target VM and check console output
+            let _ = child.kill();
+            match child.wait_with_output() {
+                Ok(out) => {
+                    aver!(
+                        tb,
+                        String::from_utf8_lossy(&out.stdout).contains(&console_text)
+                    );
+                }
+                Err(_) => aver!(tb, false),
+            }
+
             Ok(())
         });
     }

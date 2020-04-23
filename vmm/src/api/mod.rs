@@ -29,6 +29,7 @@
 //! 5. The thread handles the response and forwards potential errors.
 
 extern crate micro_http;
+extern crate vm_device;
 extern crate vmm_sys_util;
 
 pub use self::http::start_http_thread;
@@ -36,7 +37,9 @@ pub use self::http::start_http_thread;
 pub mod http;
 pub mod http_endpoint;
 
-use crate::config::{DeviceConfig, VmConfig};
+use crate::config::{
+    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig, VmConfig,
+};
 use crate::vm::{Error as VmError, VmState};
 use std::io;
 use std::sync::mpsc::{channel, RecvError, SendError, Sender};
@@ -94,6 +97,12 @@ pub enum ApiError {
     /// The VM could not reboot.
     VmReboot(VmError),
 
+    /// The VM could not be snapshotted.
+    VmSnapshot(VmError),
+
+    /// The VM could not restored.
+    VmRestore(VmError),
+
     /// The VMM could not shutdown.
     VmmShutdown(VmError),
 
@@ -105,6 +114,24 @@ pub enum ApiError {
 
     /// The device could not be removed from the VM.
     VmRemoveDevice(VmError),
+
+    /// Cannot create seccomp filter
+    CreateSeccompFilter(seccomp::SeccompError),
+
+    /// Cannot apply seccomp filter
+    ApplySeccompFilter(seccomp::Error),
+
+    /// The disk could not be added to the VM.
+    VmAddDisk(VmError),
+
+    /// The fs could not be added to the VM.
+    VmAddFs(VmError),
+
+    /// The pmem device could not be added to the VM.
+    VmAddPmem(VmError),
+
+    /// The network device could not be added to the VM.
+    VmAddNet(VmError),
 }
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -128,6 +155,12 @@ pub struct VmResizeData {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct VmRemoveDeviceData {
     pub id: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct VmSnapshotConfig {
+    /// The snapshot destination URL
+    pub destination_url: String,
 }
 
 pub enum ApiResponsePayload {
@@ -198,6 +231,24 @@ pub enum ApiRequest {
 
     /// Remove a device from the VM.
     VmRemoveDevice(Arc<VmRemoveDeviceData>, Sender<ApiResponse>),
+
+    /// Add a disk to the VM.
+    VmAddDisk(Arc<DiskConfig>, Sender<ApiResponse>),
+
+    /// Add a fs to the VM.
+    VmAddFs(Arc<FsConfig>, Sender<ApiResponse>),
+
+    /// Add a pmem device to the VM.
+    VmAddPmem(Arc<PmemConfig>, Sender<ApiResponse>),
+
+    /// Add a network device to the VM.
+    VmAddNet(Arc<NetConfig>, Sender<ApiResponse>),
+
+    /// Take a VM snapshot
+    VmSnapshot(Arc<VmSnapshotConfig>, Sender<ApiResponse>),
+
+    /// Restore from a VM snapshot
+    VmRestore(Arc<RestoreConfig>, Sender<ApiResponse>),
 }
 
 pub fn vm_create(
@@ -284,6 +335,42 @@ pub fn vm_pause(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<(
 
 pub fn vm_resume(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<()> {
     vm_action(api_evt, api_sender, VmAction::Resume)
+}
+
+pub fn vm_snapshot(
+    api_evt: EventFd,
+    api_sender: Sender<ApiRequest>,
+    data: Arc<VmSnapshotConfig>,
+) -> ApiResult<()> {
+    let (response_sender, response_receiver) = channel();
+
+    // Send the VM snapshot request.
+    api_sender
+        .send(ApiRequest::VmSnapshot(data, response_sender))
+        .map_err(ApiError::RequestSend)?;
+    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
+
+    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+
+    Ok(())
+}
+
+pub fn vm_restore(
+    api_evt: EventFd,
+    api_sender: Sender<ApiRequest>,
+    data: Arc<RestoreConfig>,
+) -> ApiResult<()> {
+    let (response_sender, response_receiver) = channel();
+
+    // Send the VM restore request.
+    api_sender
+        .send(ApiRequest::VmRestore(data, response_sender))
+        .map_err(ApiError::RequestSend)?;
+    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
+
+    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+
+    Ok(())
 }
 
 pub fn vm_info(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<VmInfo> {
@@ -379,6 +466,78 @@ pub fn vm_remove_device(
     // Send the VM remove-device request.
     api_sender
         .send(ApiRequest::VmRemoveDevice(data, response_sender))
+        .map_err(ApiError::RequestSend)?;
+    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
+
+    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+
+    Ok(())
+}
+
+pub fn vm_add_disk(
+    api_evt: EventFd,
+    api_sender: Sender<ApiRequest>,
+    data: Arc<DiskConfig>,
+) -> ApiResult<()> {
+    let (response_sender, response_receiver) = channel();
+
+    // Send the VM add-disk request.
+    api_sender
+        .send(ApiRequest::VmAddDisk(data, response_sender))
+        .map_err(ApiError::RequestSend)?;
+    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
+
+    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+
+    Ok(())
+}
+
+pub fn vm_add_fs(
+    api_evt: EventFd,
+    api_sender: Sender<ApiRequest>,
+    data: Arc<FsConfig>,
+) -> ApiResult<()> {
+    let (response_sender, response_receiver) = channel();
+
+    // Send the VM add-fs request.
+    api_sender
+        .send(ApiRequest::VmAddFs(data, response_sender))
+        .map_err(ApiError::RequestSend)?;
+    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
+
+    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+
+    Ok(())
+}
+
+pub fn vm_add_pmem(
+    api_evt: EventFd,
+    api_sender: Sender<ApiRequest>,
+    data: Arc<PmemConfig>,
+) -> ApiResult<()> {
+    let (response_sender, response_receiver) = channel();
+
+    // Send the VM add-pmem request.
+    api_sender
+        .send(ApiRequest::VmAddPmem(data, response_sender))
+        .map_err(ApiError::RequestSend)?;
+    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
+
+    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+
+    Ok(())
+}
+
+pub fn vm_add_net(
+    api_evt: EventFd,
+    api_sender: Sender<ApiRequest>,
+    data: Arc<NetConfig>,
+) -> ApiResult<()> {
+    let (response_sender, response_receiver) = channel();
+
+    // Send the VM add-net request.
+    api_sender
+        .send(ApiRequest::VmAddNet(data, response_sender))
         .map_err(ApiError::RequestSend)?;
     api_evt.write(1).map_err(ApiError::EventFdWrite)?;
 

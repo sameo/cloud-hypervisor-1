@@ -5,10 +5,10 @@ mkdir -p "$WORKLOADS_DIR"
 
 cp scripts/sha1sums $WORKLOADS_DIR
 
-FW_URL=$(curl --silent https://api.github.com/repos/cloud-hypervisor/rust-hypervisor-firmware/releases/latest | grep "browser_download_url" | grep -o 'https://.*[^ "]')
 FW="$WORKLOADS_DIR/hypervisor-fw"
 if [ ! -f "$FW" ]; then
     pushd $WORKLOADS_DIR
+    FW_URL=$(curl --silent https://api.github.com/repos/cloud-hypervisor/rust-hypervisor-firmware/releases/latest | grep "browser_download_url" | grep -o 'https://.*[^ "]')
     time wget --quiet $FW_URL || exit 1
     popd
 fi

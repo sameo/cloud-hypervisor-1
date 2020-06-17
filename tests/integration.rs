@@ -2551,6 +2551,7 @@ mod tests {
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
+    #[ignore]
     // The VFIO integration test starts cloud-hypervisor guest with 3 TAP
     // backed networking interfaces, bound through a simple bridge on the host.
     // So if the nested cloud-hypervisor succeeds in getting a directly

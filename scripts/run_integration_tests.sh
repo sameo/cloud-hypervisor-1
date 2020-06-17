@@ -80,26 +80,24 @@ time cargo test --features "integration_tests" "$@"
 EOF
 RES=$?
 
-if [ $RES -eq 0 ]; then
-    # virtio-mmio based testing
-    cargo build --release --target $BUILD_TARGET --no-default-features --features "mmio"
-    strip target/$BUILD_TARGET/release/cloud-hypervisor
-    strip target/$BUILD_TARGET/release/vhost_user_net
-    strip target/$BUILD_TARGET/release/ch-remote
+# virtio-mmio based testing
+cargo build --release --target $BUILD_TARGET --no-default-features --features "mmio"
+strip target/$BUILD_TARGET/release/cloud-hypervisor
+strip target/$BUILD_TARGET/release/vhost_user_net
+strip target/$BUILD_TARGET/release/ch-remote
 
-    sudo setcap cap_net_admin+ep target/$BUILD_TARGET/release/cloud-hypervisor
+sudo setcap cap_net_admin+ep target/$BUILD_TARGET/release/cloud-hypervisor
 
-    # Ensure test binary has the same caps as the cloud-hypervisor one
-    time cargo test --no-run --features "integration_tests,mmio" -- --nocapture || exit 1
-    ls target/debug/deps/cloud_hypervisor-* | xargs -n 1 sudo setcap cap_net_admin+ep
+# Ensure test binary has the same caps as the cloud-hypervisor one
+time cargo test --no-run --features "integration_tests,mmio" -- --nocapture || exit 1
+ls target/debug/deps/cloud_hypervisor-* | xargs -n 1 sudo setcap cap_net_admin+ep
 
-    newgrp kvm << EOF
+newgrp kvm << EOF
 export RUST_BACKTRACE=1
 time cargo test --features "integration_tests,mmio" "$@"
 EOF
 
-    RES=$?
-fi
+RES=$?
 
 # Tear VFIO test network down
 sudo ip link del vfio-br0

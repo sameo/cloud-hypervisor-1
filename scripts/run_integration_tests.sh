@@ -76,7 +76,7 @@ sudo chmod a+rwX /dev/hugepages
 sudo adduser $USER kvm
 newgrp kvm << EOF
 export RUST_BACKTRACE=1
-time cargo test --features "integration_tests" "$@" -- --nocapture
+time cargo test --features "integration_tests" "$@"
 EOF
 RES=$?
 
@@ -95,7 +95,7 @@ if [ $RES -eq 0 ]; then
 
     newgrp kvm << EOF
 export RUST_BACKTRACE=1
-time cargo test --features "integration_tests,mmio" "$@" -- --nocapture
+time cargo test --features "integration_tests,mmio" "$@"
 EOF
 
     RES=$?

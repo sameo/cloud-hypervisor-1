@@ -947,7 +947,7 @@ mod tests {
             assert_eq!(guest.get_pci_bridge_class().unwrap_or_default(), "0x060000");
 
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.try_wait();
         });
     }
 
@@ -976,7 +976,7 @@ mod tests {
             "smpboot: Allowing 4 CPUs, 2 hotplug CPUs"
         );
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -997,7 +997,7 @@ mod tests {
         assert!(guest.get_total_memory().unwrap_or_default() > 5_000_000);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -1018,7 +1018,7 @@ mod tests {
         assert!(guest.get_total_memory().unwrap_or_default() > 128_000_000);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -1047,7 +1047,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[test]
@@ -1088,7 +1088,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[test]
@@ -1129,7 +1129,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[test]
@@ -1170,7 +1170,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -1242,7 +1242,7 @@ mod tests {
             4
         );
         let _ = cloud_child.kill();
-        let _ = cloud_child.wait();
+        let _ = cloud_child.try_wait();
     }
 
     type PrepareNetDaemon =
@@ -1395,12 +1395,12 @@ mod tests {
         }
 
         let _ = cloud_child.kill();
-        let _ = cloud_child.wait();
+        let _ = cloud_child.try_wait();
 
         if let Some(mut daemon_child) = daemon_child {
             thread::sleep(std::time::Duration::new(5, 0));
             let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
+            let _ = daemon_child.try_wait();
         }
     }
 
@@ -1624,12 +1624,12 @@ mod tests {
         guest.ssh_command("rm -r mount_image").unwrap();
 
         let _ = cloud_child.kill();
-        let _ = cloud_child.wait();
+        let _ = cloud_child.try_wait();
 
         if let Some(mut daemon_child) = daemon_child {
             thread::sleep(std::time::Duration::new(5, 0));
             let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
+            let _ = daemon_child.try_wait();
         }
     }
 
@@ -1752,12 +1752,12 @@ mod tests {
         }
 
         let _ = cloud_child.kill();
-        let _ = cloud_child.wait();
+        let _ = cloud_child.try_wait();
 
         if let Some(mut daemon_child) = daemon_child {
             thread::sleep(std::time::Duration::new(5, 0));
             let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
+            let _ = daemon_child.try_wait();
         }
     }
 
@@ -1807,7 +1807,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     fn test_virtio_fs(
@@ -1991,13 +1991,13 @@ mod tests {
                 "foo"
             );
             let _ = daemon_child.kill();
-            let _ = daemon_child.wait();
+            let _ = daemon_child.try_wait();
         }
 
         let _ = child.kill();
         let _ = daemon_child.kill();
-        let _ = child.wait();
-        let _ = daemon_child.wait();
+        let _ = child.try_wait();
+        let _ = daemon_child.try_wait();
     }
 
     #[test]
@@ -2148,7 +2148,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[test]
@@ -2204,7 +2204,7 @@ mod tests {
         assert!(guest.get_total_memory().unwrap_or_default() > 496_000);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -2246,7 +2246,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -2297,7 +2297,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     fn test_serial_off() {
@@ -2339,7 +2339,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -2372,11 +2372,14 @@ mod tests {
         );
 
         let _ = child.kill();
-        match child.wait_with_output() {
-            Ok(out) => {
-                assert!(!String::from_utf8_lossy(&out.stdout).contains("cloud login:"));
+        if let Ok(Some(status)) = child.try_wait() {
+            assert_eq!(status.success(), true);
+            match child.wait_with_output() {
+                Ok(out) => {
+                    assert!(!String::from_utf8_lossy(&out.stdout).contains("cloud login:"));
+                }
+                Err(_) => assert!(false),
             }
-            Err(_) => assert!(false),
         }
     }
 
@@ -2410,11 +2413,14 @@ mod tests {
         );
 
         let _ = child.kill();
-        match child.wait_with_output() {
-            Ok(out) => {
-                assert!(String::from_utf8_lossy(&out.stdout).contains("cloud login:"));
+        if let Ok(Some(status)) = child.try_wait() {
+            assert_eq!(status.success(), true);
+            match child.wait_with_output() {
+                Ok(out) => {
+                    assert!(String::from_utf8_lossy(&out.stdout).contains("cloud login:"));
+                }
+                Err(_) => assert!(false),
             }
-            Err(_) => assert!(false),
         }
     }
 
@@ -2453,15 +2459,15 @@ mod tests {
         guest.ssh_command("sudo shutdown -h now").unwrap();
 
         // Check that the cloud-hypervisor binary actually terminated
-        if let Ok(status) = child.wait() {
+        if let Ok(Some(status)) = child.try_wait() {
             assert_eq!(status.success(), true);
+            // Do this check after shutdown of the VM as an easy way to ensure
+            // all writes are flushed to disk
+            let mut f = std::fs::File::open(serial_path).unwrap();
+            let mut buf = String::new();
+            f.read_to_string(&mut buf).unwrap();
+            assert!(buf.contains("cloud login:"));
         }
-        // Do this check after shutdown of the VM as an easy way to ensure
-        // all writes are flushed to disk
-        let mut f = std::fs::File::open(serial_path).unwrap();
-        let mut buf = String::new();
-        f.read_to_string(&mut buf).unwrap();
-        assert!(buf.contains("cloud login:"));
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -2493,11 +2499,14 @@ mod tests {
 
         let _ = child.kill();
 
-        match child.wait_with_output() {
-            Ok(out) => {
-                assert!(String::from_utf8_lossy(&out.stdout).contains(&text));
+        if let Ok(Some(status)) = child.try_wait() {
+            assert_eq!(status.success(), true);
+            match child.wait_with_output() {
+                Ok(out) => {
+                    assert!(String::from_utf8_lossy(&out.stdout).contains(&text));
+                }
+                Err(_) => assert!(false),
             }
-            Err(_) => assert!(false),
         }
     }
 
@@ -2524,10 +2533,13 @@ mod tests {
 
         guest.ssh_command("sudo shutdown -h now").unwrap();
 
+        thread::sleep(std::time::Duration::new(10, 0));
+
         // Check that the cloud-hypervisor binary actually terminated
-        if let Ok(status) = child.wait() {
+        if let Ok(Some(status)) = child.try_wait() {
             assert_eq!(status.success(), true);
         }
+
         // Do this check after shutdown of the VM as an easy way to ensure
         // all writes are flushed to disk
         let mut f = std::fs::File::open(console_path).unwrap();
@@ -2753,8 +2765,8 @@ mod tests {
 
         let _ = child.kill();
         let _ = daemon_child.kill();
-        let _ = child.wait();
-        let _ = daemon_child.wait();
+        let _ = child.try_wait();
+        let _ = daemon_child.try_wait();
     }
 
     #[cfg_attr(feature = "mmio", test)]
@@ -2787,7 +2799,7 @@ mod tests {
         assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     fn get_fd_count(pid: u32) -> usize {
@@ -2848,10 +2860,9 @@ mod tests {
                 .unwrap_or_default();
 
             // Check that the cloud-hypervisor binary actually terminated
-            if let Ok(status) = child.wait() {
+            if let Ok(Some(status)) = child.try_wait() {
                 assert_eq!(status.success(), true);
             }
-            let _ = child.wait();
         });
     }
 
@@ -2903,10 +2914,9 @@ mod tests {
         thread::sleep(std::time::Duration::new(20, 0));
 
         // Check that the cloud-hypervisor binary actually terminated
-        if let Ok(status) = child.wait() {
+        if let Ok(Some(status)) = child.try_wait() {
             assert_eq!(status.success(), true);
         }
-        let _ = child.wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -2989,7 +2999,7 @@ mod tests {
         }
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3033,7 +3043,7 @@ mod tests {
         assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3107,7 +3117,7 @@ mod tests {
         assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3184,7 +3194,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     // We cannot force the software running in the guest to reprogram the BAR
@@ -3272,7 +3282,7 @@ mod tests {
         assert_ne!(init_bar_addr, new_bar_addr);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     fn get_pss(pid: u32) -> u32 {
@@ -3353,8 +3363,8 @@ mod tests {
 
         let _ = child1.kill();
         let _ = child2.kill();
-        let _ = child1.wait();
-        let _ = child2.wait();
+        let _ = child1.try_wait();
+        let _ = child2.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3443,7 +3453,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3533,7 +3543,7 @@ mod tests {
         assert!(guest.get_total_memory().unwrap_or_default() < 1_964_000);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3588,7 +3598,7 @@ mod tests {
         assert!(guest.get_total_memory().unwrap_or_default() < 1_964_000);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     // Test both vCPU and memory resizing together
@@ -3642,7 +3652,7 @@ mod tests {
         assert!(guest.get_total_memory().unwrap_or_default() > 982_000);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     fn _get_vmm_overhead(pid: u32, guest_memory_size: u32) -> HashMap<String, u32> {
@@ -3735,7 +3745,7 @@ mod tests {
         assert!(overhead <= MAXIMUM_VMM_OVERHEAD_KB);
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3851,7 +3861,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -3966,7 +3976,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
@@ -4030,7 +4040,7 @@ mod tests {
         );
 
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.try_wait();
     }
 
     #[test]
@@ -4066,11 +4076,15 @@ mod tests {
                 thread::sleep(std::time::Duration::new(20, 0));
 
                 let _ = child.kill();
-                match child.wait_with_output() {
-                    Ok(out) => {
-                        let s = String::from_utf8_lossy(&out.stdout);
-                        assert_ne!(s.lines().position(|line| line == test_string), None);
-                    }
+                match child.try_wait() {
+                    Ok(Some(_)) => match child.wait_with_output() {
+                        Ok(out) => {
+                            let s = String::from_utf8_lossy(&out.stdout);
+                            assert_ne!(s.lines().position(|line| line == test_string), None);
+                        }
+                        Err(_) => assert!(false),
+                    },
+                    Ok(None) => assert!(false),
                     Err(_) => assert!(false),
                 }
             });
@@ -4194,11 +4208,14 @@ mod tests {
 
         // Shutdown the source VM and check console output
         let _ = child.kill();
-        match child.wait_with_output() {
-            Ok(out) => {
-                assert!(String::from_utf8_lossy(&out.stdout).contains(&console_text));
+        if let Ok(Some(status)) = child.try_wait() {
+            assert_eq!(status.success(), true);
+            match child.wait_with_output() {
+                Ok(out) => {
+                    assert!(String::from_utf8_lossy(&out.stdout).contains(&console_text));
+                }
+                Err(_) => assert!(false),
             }
-            Err(_) => assert!(false),
         }
 
         // Remove the vsock socket file.
@@ -4239,11 +4256,14 @@ mod tests {
 
         // Shutdown the target VM and check console output
         let _ = child.kill();
-        match child.wait_with_output() {
-            Ok(out) => {
-                assert!(String::from_utf8_lossy(&out.stdout).contains(&console_text));
+        if let Ok(Some(status)) = child.try_wait() {
+            assert_eq!(status.success(), true);
+            match child.wait_with_output() {
+                Ok(out) => {
+                    assert!(String::from_utf8_lossy(&out.stdout).contains(&console_text));
+                }
+                Err(_) => assert!(false),
             }
-            Err(_) => assert!(false),
         }
     }
 }

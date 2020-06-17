@@ -9,6 +9,10 @@ source ./scripts/prepare_artifacts.sh
 # Set default libc if we're not being called from dev_cli.sh
 : "${CH_LIBC:="gnu"}"
 
+# Set default test threads
+
+: "${CH_TEST_THREADS:=10}"
+
 # VFIO test network setup.
 # We reserve a different IP class for it: 172.17.0.0/24.
 sudo ip link add name vfio-br0 type bridge
@@ -76,7 +80,7 @@ sudo chmod a+rwX /dev/hugepages
 sudo adduser $USER kvm
 newgrp kvm << EOF
 export RUST_BACKTRACE=1
-time cargo test --features "integration_tests" "$@"
+time cargo test --features "integration_tests" "$@" -- --test-threads=$CH_TEST_THREADS
 EOF
 RES=$?
 
@@ -94,7 +98,7 @@ ls target/debug/deps/cloud_hypervisor-* | xargs -n 1 sudo setcap cap_net_admin+e
 
 newgrp kvm << EOF
 export RUST_BACKTRACE=1
-time cargo test --features "integration_tests,mmio" "$@"
+time cargo test --features "integration_tests,mmio" "$@" -- --test-threads=$CH_TEST_THREADS
 EOF
 
 RES=$?

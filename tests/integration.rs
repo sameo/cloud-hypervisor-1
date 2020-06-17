@@ -21,12 +21,14 @@ mod tests {
     use std::io;
     use std::io::BufRead;
     use std::io::{Read, Write};
+    use std::net::SocketAddr;
     use std::net::TcpStream;
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::string::String;
     use std::sync::Mutex;
     use std::thread;
+    use std::time::Duration;
     use tempdir::TempDir;
     use tempfile::NamedTempFile;
 
@@ -519,9 +521,15 @@ mod tests {
         let mut counter = 0;
         loop {
             match (|| -> Result<(), Error> {
-                let tcp = TcpStream::connect(format!("{}:22", ip)).map_err(Error::Connection)?;
+                let socket_addr: SocketAddr = format!("{}:22", ip).parse().unwrap();
+                let tcp = TcpStream::connect_timeout(
+                    &socket_addr,
+                    Duration::from_secs(DEFAULT_SSH_TIMEOUT.into()),
+                )
+                .map_err(Error::Connection)?;
                 let mut sess = Session::new().unwrap();
                 sess.set_tcp_stream(tcp);
+                sess.set_timeout(DEFAULT_SSH_TIMEOUT as u32 * 1000);
                 sess.handshake().map_err(Error::Handshake)?;
 
                 sess.userauth_password("cloud", "cloud123")

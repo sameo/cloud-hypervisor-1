@@ -112,4 +112,6 @@ sudo ip link del vfio-tap3
 sudo ip link del vunet-tap0
 sudo ip link del vunet-tap1
 
+echo "## CLOUD HYPERVISOR CI END ##"
+
 exit $RES

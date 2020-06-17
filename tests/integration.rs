@@ -876,7 +876,10 @@ mod tests {
                     .stdout(Stdio::piped())
                     .spawn()
             } else {
-                self.command.spawn()
+                self.command
+                    .stderr(Stdio::null())
+                    .stdout(Stdio::null())
+                    .spawn()
             }
         }
 

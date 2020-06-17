@@ -101,6 +101,8 @@ mod tests {
                      no_timer_check noreplace-smp cryptomgr.notests \
                      rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw";
 
+    const MEMORY_512M_THRESHOLD: u32 = 256_000;
+
     impl UbuntuDiskConfig {
         fn new(image_name: String) -> Self {
             UbuntuDiskConfig {
@@ -1073,7 +1075,7 @@ mod tests {
         thread::sleep(std::time::Duration::new(20, 0));
 
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-        assert!(guest.get_total_memory().unwrap_or_default() > 496_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
         assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
         #[cfg(not(feature = "mmio"))]
@@ -1114,7 +1116,7 @@ mod tests {
         thread::sleep(std::time::Duration::new(20, 0));
 
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-        assert!(guest.get_total_memory().unwrap_or_default() > 496_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
         assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
         #[cfg(not(feature = "mmio"))]
@@ -1155,7 +1157,7 @@ mod tests {
         thread::sleep(std::time::Duration::new(20, 0));
 
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-        assert!(guest.get_total_memory().unwrap_or_default() > 496_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
         assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
         #[cfg(not(feature = "mmio"))]
@@ -1724,7 +1726,7 @@ mod tests {
 
         // Just check the VM booted correctly.
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), num_queues as u32);
-        assert!(guest.get_total_memory().unwrap_or_default() > 491_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
 
         if self_spawned {
             // The reboot is not supported with mmio, so no reason to test it.
@@ -2201,7 +2203,7 @@ mod tests {
 
         // Simple checks to validate the VM booted properly
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-        assert!(guest.get_total_memory().unwrap_or_default() > 496_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
 
         let _ = child.kill();
         let _ = child.try_wait();
@@ -2748,7 +2750,7 @@ mod tests {
         // up as expected. In order to check, we will use the virtio-net
         // device already passed through L2 as a VFIO device, this will
         // verify that VFIO devices are functional with memory hotplug.
-        assert!(guest.get_total_memory_l2().unwrap_or_default() > 491_000);
+        assert!(guest.get_total_memory_l2().unwrap_or_default() > MEMORY_512M_THRESHOLD);
         guest
             .ssh_command_l2_1(
                 "sudo bash -c 'echo online > /sys/devices/system/memory/auto_online_blocks'",
@@ -2795,7 +2797,7 @@ mod tests {
         thread::sleep(std::time::Duration::new(20, 0));
 
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-        assert!(guest.get_total_memory().unwrap_or_default() > 496_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
         assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
         let _ = child.kill();
@@ -3037,7 +3039,7 @@ mod tests {
 
         // Check that the VM booted as expected
         assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-        assert!(guest.get_total_memory().unwrap_or_default() > 491_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
         assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
         let _ = child.kill();
@@ -3083,7 +3085,7 @@ mod tests {
 
         // Check that the VM booted as expected
         assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-        assert!(guest.get_total_memory().unwrap_or_default() > 491_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
         assert!(guest.get_entropy().unwrap_or_default() >= 900);
 
         // We now pause the VM
@@ -3477,7 +3479,7 @@ mod tests {
 
         thread::sleep(std::time::Duration::new(20, 0));
 
-        assert!(guest.get_total_memory().unwrap_or_default() > 491_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
 
         guest
             .ssh_command("echo online | sudo tee /sys/devices/system/memory/auto_online_blocks")
@@ -3567,7 +3569,7 @@ mod tests {
 
         thread::sleep(std::time::Duration::new(20, 0));
 
-        assert!(guest.get_total_memory().unwrap_or_default() > 491_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
 
         guest
             .ssh_command("echo online | sudo tee /sys/devices/system/memory/auto_online_blocks")
@@ -3624,7 +3626,7 @@ mod tests {
         thread::sleep(std::time::Duration::new(20, 0));
 
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), 2);
-        assert!(guest.get_total_memory().unwrap_or_default() > 491_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MEMORY_512M_THRESHOLD);
 
         guest
             .ssh_command("echo online | sudo tee /sys/devices/system/memory/auto_online_blocks")

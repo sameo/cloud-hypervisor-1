@@ -93,7 +93,6 @@ mod tests {
         image_name: String,
     }
 
-    const BIONIC_IMAGE_NAME: &str = "bionic-server-cloudimg-amd64-raw.img";
     const FOCAL_IMAGE_NAME: &str = "focal-server-cloudimg-amd64-raw.img";
 
     const CLEAR_KERNEL_CMDLINE: &str = "root=PARTUUID=6fb4d1a8-6c8c-4dd7-9f7c-1fe0b9f2574c \
@@ -919,12 +918,10 @@ mod tests {
     #[cfg_attr(not(feature = "mmio"), test)]
     fn test_simple_launch() {
         let mut clear = ClearDiskConfig::new();
-        let mut bionic = UbuntuDiskConfig::new(BIONIC_IMAGE_NAME.to_string());
         let mut focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
 
         vec![
             &mut clear as &mut dyn DiskConfig,
-            &mut bionic as &mut dyn DiskConfig,
             &mut focal as &mut dyn DiskConfig,
         ]
         .iter_mut()
@@ -956,8 +953,8 @@ mod tests {
 
     #[cfg_attr(not(feature = "mmio"), test)]
     fn test_multi_cpu() {
-        let mut bionic = UbuntuDiskConfig::new(BIONIC_IMAGE_NAME.to_string());
-        let guest = Guest::new(&mut bionic);
+        let mut focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(&mut focal);
         let mut child = GuestCommand::new(&guest)
             .args(&["--cpus", "boot=2,max=4"])
             .args(&["--memory", "size=512M"])
@@ -2812,12 +2809,10 @@ mod tests {
     #[cfg_attr(not(feature = "mmio"), test)]
     fn test_reboot() {
         let mut clear = ClearDiskConfig::new();
-        let mut bionic = UbuntuDiskConfig::new(BIONIC_IMAGE_NAME.to_string());
         let mut focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
 
         vec![
             &mut clear as &mut dyn DiskConfig,
-            &mut bionic as &mut dyn DiskConfig,
             &mut focal as &mut dyn DiskConfig,
         ]
         .iter_mut()

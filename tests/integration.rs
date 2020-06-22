@@ -99,7 +99,7 @@ mod tests {
                      console=tty0 console=ttyS0,115200n8 console=hvc0 quiet \
                      init=/usr/lib/systemd/systemd-bootchart initcall_debug tsc=reliable \
                      no_timer_check noreplace-smp cryptomgr.notests \
-                     rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 rw";
+                     rootfstype=ext4,btrfs,xfs kvm-intel.nested=1 reboot=acpi rw";
 
     const MEMORY_512M_THRESHOLD: u32 = 256_000;
 

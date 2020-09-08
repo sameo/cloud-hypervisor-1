@@ -2023,6 +2023,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_virtio_fs_dax_on_cache_size_1_gib_w_vhost_user_fs_daemon() {
         test_virtio_fs(
             true,
@@ -3866,6 +3867,7 @@ mod tests {
     }
 
     #[cfg_attr(not(feature = "mmio"), test)]
+    #[ignore]
     fn test_pmem_hotplug() {
         let mut clear = ClearDiskConfig::new();
         let guest = Guest::new(&mut clear);
@@ -4045,6 +4047,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_initramfs() {
         let mut clear = ClearDiskConfig::new();
         let guest = Guest::new(&mut clear);

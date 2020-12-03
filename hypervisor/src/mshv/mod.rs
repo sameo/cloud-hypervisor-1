@@ -13,6 +13,18 @@
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
+use mshv_bindings::Msrs as MsrEntries;
+pub use mshv_bindings::*;
+use mshv_ioctls::{set_registers_64, Mshv, VcpuFd, VmFd};
+
+/// Vcpu struct for Hyper-V
+pub struct MshvVcpu {
+    fd: VcpuFd,
+    vp_index: u8,
+    cpuid: CpuId,
+    msrs: MsrEntries,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct MshvIrqRoutingMsi {
     pub address_lo: u32,

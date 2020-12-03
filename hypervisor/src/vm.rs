@@ -15,8 +15,12 @@ use crate::device::Device;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::ClockData;
 #[cfg(feature = "kvm")]
+use crate::CreateDevice;
+#[cfg(feature = "mshv")]
+use crate::HvState as VmState;
+#[cfg(feature = "kvm")]
 use crate::KvmVmState as VmState;
-use crate::{CreateDevice, IoEventAddress, IrqRoutingEntry, MemoryRegion};
+use crate::{IoEventAddress, IrqRoutingEntry, MemoryRegion};
 #[cfg(feature = "kvm")]
 use kvm_ioctls::Cap;
 use std::sync::Arc;
@@ -26,6 +30,7 @@ use vmm_sys_util::eventfd::EventFd;
 ///
 /// I/O events data matches (32 or 64 bits).
 ///
+#[derive(Debug)]
 pub enum DataMatch {
     DataMatch32(u32),
     DataMatch64(u64),
@@ -120,6 +125,10 @@ pub enum HypervisorVmError {
     #[error("Failed to create passthrough device: {0}")]
     CreatePassthroughDevice(#[source] anyhow::Error),
     ///
+    /// Failed to request virtual interrupt
+    ///
+    #[error("Failed to request virtual interupt: {0}")]
+    RequestVirtualInterrupt(#[source] anyhow::Error),
     /// Write to Guest memory
     ///
     #[error("Failed to write to guest memory: {0}")]
@@ -220,6 +229,18 @@ pub trait Vm: Send + Sync {
     fn check_extension(&self, c: Cap) -> bool;
     /// Create a device that is used for passthrough
     fn create_passthrough_device(&self) -> Result<Arc<dyn Device>>;
+    /// XXX temp workaround for Hyper-V, never used on KVM
+    fn request_virtual_interrupt(
+        &self,
+        _interrupt_type: u8,
+        _apic_id: u64,
+        _vector: u32,
+        _level_triggered: bool,
+        _logical_destination_mode: bool,
+        _long_mode: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Get the Vm state. Return VM specific data
     fn state(&self) -> Result<VmState>;
     /// Set the VM state

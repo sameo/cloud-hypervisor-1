@@ -62,3 +62,5 @@ pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {
 
     Ok(Arc::new(hv))
 }
+
+pub mod mshv;

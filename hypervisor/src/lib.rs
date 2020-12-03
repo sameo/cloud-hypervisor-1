@@ -52,10 +52,8 @@ pub use cpu::{HypervisorCpuError, Vcpu, VmExit};
 pub use device::{Device, HypervisorDeviceError};
 #[cfg(feature = "kvm")]
 pub use kvm::*;
-pub use vm::{DataMatch, HypervisorVmError, Vm};
-#[cfg(all(feature = "mshv", target_arch = "x86_64"))]
-pub mod mshv;
 use std::sync::Arc;
+pub use vm::{DataMatch, HypervisorVmError, Vm};
 
 pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {
     #[cfg(feature = "kvm")]

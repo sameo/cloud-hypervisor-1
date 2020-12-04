@@ -17,7 +17,7 @@ use crate::cpu::Vcpu;
 use crate::hypervisor;
 use crate::vm::{self, VmmOps};
 pub use mshv_bindings::*;
-use mshv_ioctls::{set_registers_64, Mshv, VcpuFd, VmFd};
+use mshv_ioctls::{set_registers_64, InterruptReqeust, Mshv, VcpuFd, VmFd};
 
 use serde_derive::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -1039,6 +1039,17 @@ impl vm::Vm for MshvVm {
         logical_destination_mode: bool,
         long_mode: bool,
     ) -> vm::Result<()> {
+        let request: InterruptReqeust = InterruptReqeust {
+            interrupt_type: interrupt_type.into(),
+            apic_id,
+            vector,
+            level_triggered,
+            logical_destination_mode,
+            long_mode,
+        };
+        self.fd
+            .request_virtual_interrupt(&request)
+            .map_err(|e| vm::HypervisorVmError::RequestVirtualInterrupt(e.into()))?;
         Ok(())
     }
     ///

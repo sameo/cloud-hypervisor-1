@@ -53,7 +53,8 @@ pub use device::{Device, HypervisorDeviceError};
 #[cfg(feature = "kvm")]
 pub use kvm::*;
 pub use vm::{DataMatch, HypervisorVmError, Vm};
-
+#[cfg(all(feature = "mshv", target_arch = "x86_64"))]
+pub mod mshv;
 use std::sync::Arc;
 
 pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {
@@ -62,5 +63,3 @@ pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {
 
     Ok(Arc::new(hv))
 }
-
-pub mod mshv;

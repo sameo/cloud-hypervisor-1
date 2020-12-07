@@ -52,10 +52,10 @@ pub struct HvState {
 pub use HvState as VmState;
 
 struct IrqfdCtrlEpollHandler {
-    vm: Arc<dyn vm::Vm>, /* For issuing hypercall */
-    irqfd: EventFd,      /* Registered by caller */
-    kill: EventFd,       /* Created by us, signal thread exit */
-    epoll_fd: RawFd,     /* epoll fd */
+    vm_fd: Arc<VmFd>, /* For issuing hypercall */
+    irqfd: EventFd,   /* Registered by caller */
+    kill: EventFd,    /* Created by us, signal thread exit */
+    epoll_fd: RawFd,  /* epoll fd */
     gsi: u32,
     gsi_routes: Arc<RwLock<HashMap<u32, MshvIrqRoutingEntry>>>,
 }
@@ -78,6 +78,46 @@ const KILL_EVENT: u16 = 1;
 const IRQFD_EVENT: u16 = 2;
 
 impl IrqfdCtrlEpollHandler {
+    fn assert_virtual_interrupt(&self, e: &MshvIrqRoutingEntry) -> vm::Result<()> {
+        // GSI routing contains MSI information.
+        // We still need to translate that to APIC ID etc
+
+        debug!("Inject {:x?}", e);
+
+        let MshvIrqRouting::Msi(msi) = e.route;
+
+        /* Make an assumption here ... */
+        if msi.address_hi != 0 {
+            panic!("MSI high address part is not zero");
+        }
+
+        let typ = get_interrupt_type(get_delivery_mode(msi.data)).unwrap();
+        let apic_id = get_destination(msi.address_lo);
+        let vector = get_vector(msi.data);
+        let level_triggered = get_trigger_mode(msi.data);
+        let logical_destination_mode = get_destination_mode(msi.address_lo);
+
+        debug!(
+            "{:x} {:x} {:x} {} {}",
+            typ, apic_id, vector, level_triggered, logical_destination_mode
+        );
+
+        let request: InterruptReqeust = InterruptReqeust {
+            interrupt_type: typ,
+            apic_id,
+            vector: vector.into(),
+            level_triggered,
+            logical_destination_mode,
+            long_mode: false,
+        };
+
+        self.vm_fd
+            .request_virtual_interrupt(&request)
+            .map_err(|e| vm::HypervisorVmError::RequestVirtualInterrupt(e.into()))?;
+
+        Ok(())
+    }
+
     fn run_ctrl(&mut self) {
         self.epoll_fd = epoll::create(true).unwrap();
         let epoll_file = unsafe { File::from_raw_fd(self.epoll_fd) };
@@ -134,7 +174,9 @@ impl IrqfdCtrlEpollHandler {
                         let gsi_routes = self.gsi_routes.read().unwrap();
 
                         if let Some(e) = gsi_routes.get(&self.gsi) {
-                            assert_virtual_interrupt(&self.vm, &e);
+                            self.assert_virtual_interrupt(&e).unwrap_or_else(|err| {
+                                info!("Failed to request virtual interrupt: {:?}", err);
+                            });
                         } else {
                             debug!("No routing info found for GSI {}", self.gsi);
                         }
@@ -211,43 +253,6 @@ fn get_level(message_data: u32) -> bool {
     }
 
     false
-}
-
-fn assert_virtual_interrupt(vm: &Arc<dyn vm::Vm>, e: &MshvIrqRoutingEntry) {
-    // GSI routing contains MSI information.
-    // We still need to translate that to APIC ID etc
-
-    debug!("Inject {:x?}", e);
-
-    let MshvIrqRouting::Msi(msi) = e.route;
-
-    /* Make an assumption here ... */
-    if msi.address_hi != 0 {
-        panic!("MSI high address part is not zero");
-    }
-
-    let typ = get_interrupt_type(get_delivery_mode(msi.data)).unwrap();
-    let apic_id = get_destination(msi.address_lo);
-    let vector = get_vector(msi.data);
-    let level_triggered = get_trigger_mode(msi.data);
-    let logical_destination_mode = get_destination_mode(msi.address_lo);
-
-    debug!(
-        "{:x} {:x} {:x} {} {}",
-        typ, apic_id, vector, level_triggered, logical_destination_mode
-    );
-
-    vm.request_virtual_interrupt(
-        typ as u8,
-        apic_id,
-        vector.into(),
-        level_triggered,
-        logical_destination_mode,
-        false,
-    )
-    .unwrap_or_else(|err| {
-        info!("Failed to request virtual interrupt: {:?}", err);
-    });
 }
 
 /// Wrapper over mshv system ioctls.
@@ -935,9 +940,10 @@ impl vm::Vm for MshvVm {
     fn register_irqfd(&self, fd: &EventFd, gsi: u32, vm: Arc<dyn vm::Vm>) -> vm::Result<()> {
         let dup_fd = fd.try_clone().unwrap();
         let kill_fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        //let foo = Arc::new(self);
 
         let mut ctrl_handler = IrqfdCtrlEpollHandler {
-            vm,
+            vm_fd: self.fd.clone(), //Arc::clone(&self as &dyn vm::Vm),
             kill: kill_fd.try_clone().unwrap(),
             irqfd: fd.try_clone().unwrap(),
             epoll_fd: 0,
@@ -1070,28 +1076,6 @@ impl vm::Vm for MshvVm {
         Ok(())
     }
 
-    fn request_virtual_interrupt(
-        &self,
-        interrupt_type: u8,
-        apic_id: u64,
-        vector: u32,
-        level_triggered: bool,
-        logical_destination_mode: bool,
-        long_mode: bool,
-    ) -> vm::Result<()> {
-        let request: InterruptReqeust = InterruptReqeust {
-            interrupt_type: interrupt_type.into(),
-            apic_id,
-            vector,
-            level_triggered,
-            logical_destination_mode,
-            long_mode,
-        };
-        self.fd
-            .request_virtual_interrupt(&request)
-            .map_err(|e| vm::HypervisorVmError::RequestVirtualInterrupt(e.into()))?;
-        Ok(())
-    }
     ///
     /// Get the Vm state. Return VM specific data
     ///
